@@ -1,0 +1,13 @@
+/build/
+/build-*/
+/pbe-benchmark/
+__pycache__/
+*.pyc
+.DS_Store
+/SPEC.md
+/Parallel_Backup_Engine_SPEC_v1.1.md
+/reports/
+/work/
+/paravault-cpp-hpp.zip
+/fixtures/
+/demo/
