@@ -55,7 +55,7 @@ def main() -> None:
         run(pbe, "init", "--repo", str(repo), expected=2)
         run(pbe, "stats", "--repo", str(repo), "--workers", "9", expected=2)
         run(pbe, "backup", "--repo", str(repo), "--source", str(source), "--json", expected=2)
-        backup = run(pbe, "backup", "--repo", str(repo), "--source", str(source), "--workers", "2", "--writer-workers", "1", "--memory-mib", "8")
+        backup = run(pbe, "backup", "--repo", str(repo), "--source", str(source), "--workers", "2", "--writer-workers", "2", "--memory-mib", "8")
         snapshot = re.search(r"^Snapshot:\s+(\S+)$", backup, re.MULTILINE)
         run_id = re.search(r"^Run ID:\s+(\S+)$", backup, re.MULTILINE)
         if not snapshot or not run_id:
@@ -70,7 +70,7 @@ def main() -> None:
         stage_metrics = trace_rows[0]["observations"]
         if not {"cpu_compute_ratio", "controlled_cpu_ms", "hash_ms", "compression_ms", "decompression_ms", "object_verify_ms", "object_io_ms", "writer_workers", "source_read_ms", "catalog_commit_ms", "object_staging_write_ms", "object_file_sync_ms", "object_publish_ms", "object_directory_sync_ms", "object_write_total_ms", "object_write_count", "object_write_operation_count"}.issubset(stage_metrics):
             raise AssertionError(f"decision trace omitted stage timing fields: {stage_metrics}")
-        if stage_metrics["writer_workers"] != 1:
+        if stage_metrics["writer_workers"] != 2:
             raise AssertionError(f"decision trace omitted configured object-writer count: {stage_metrics}")
 
         listed = run(pbe, "list", "--repo", str(repo))

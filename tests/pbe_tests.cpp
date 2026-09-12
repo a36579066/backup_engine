@@ -397,7 +397,30 @@ void backup_round_trip() {
     fs::remove_all(root);
 }
 
-
+void parallel_object_writer_round_trip() {
+    const auto root = fs::temp_directory_path() / ("pbe-writer-pool-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const auto repo = root / "repo";
+    const auto source = root / "source";
+    fs::create_directories(source);
+    for (std::size_t index = 0; index < 8; ++index)
+        write_bytes(source / ("unique-" + std::to_string(index) + ".bin"),
+                    std::vector<std::uint8_t>(1u << 20, static_cast<std::uint8_t>('A' + index)));
+    pbe::init_repository(repo);
+    pbe::BackupOptions options;
+    options.repo = repo;
+    options.source = source;
+    options.workers = 8;
+    options.writer_workers = 4;
+    options.memory_mib = 32;
+    options.test_writer_delay_ms = 20;
+    const auto snapshot = pbe::backup(options);
+    check(snapshot.writer_workers == 4, "backup summary reports the object writer pool size");
+    check(snapshot.files == 8 && snapshot.logical_bytes == 8ull * (1u << 20),
+          "parallel object writers publish all source entries");
+    check(pbe::verify_snapshot(repo, snapshot.id).bytes == snapshot.logical_bytes,
+          "parallel object writer output passes full verification");
+    fs::remove_all(root);
+}
 
 
 
@@ -746,6 +769,8 @@ int main() {
         initialization_refuses_existing_data();
         std::cout << "[TEST] backup_round_trip\n" << std::flush;
         backup_round_trip();
+        std::cout << "[TEST] parallel_object_writer_round_trip\n" << std::flush;
+        parallel_object_writer_round_trip();
         std::cout << "[TEST] chunk_boundaries\n" << std::flush;
         chunk_boundaries();
         std::cout << "[TEST] codec_fallback_round_trip\n" << std::flush;

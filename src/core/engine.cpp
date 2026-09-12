@@ -512,8 +512,8 @@ BackupSummary backup(const BackupOptions& options) {
     const std::size_t workers_count = options.adaptive
         ? (options.max_workers ? options.max_workers : options.workers) : options.workers;
     if (workers_count == 0 || workers_count > 256) throw std::runtime_error("worker count must be between 1 and 256");
-    if (options.writer_workers != 1)
-        throw std::runtime_error("this milestone supports exactly one object writer");
+    if (options.writer_workers == 0 || options.writer_workers > 32)
+        throw std::runtime_error("writer worker count must be between 1 and 32");
     if (options.memory_mib < 3 || options.memory_mib > (std::numeric_limits<std::size_t>::max() >> 20))
         throw std::runtime_error("--memory-mib must be at least 3 and fit in this process");
     if (options.zstd_level < ZSTD_minCLevel() || options.zstd_level > ZSTD_maxCLevel())
@@ -558,7 +558,7 @@ BackupSummary backup(const BackupOptions& options) {
     PipelineMetrics metrics;
     metrics.process_rss_peak_bytes.store(current_rss_bytes(), std::memory_order_relaxed);
     FixedWorkerPool cpu_workers;
-    std::thread blob_writer;
+    FixedWorkerPool blob_writers;
     std::thread monitor;
     std::atomic<bool> monitor_stop{false};
     bool monitor_started = false;
@@ -576,7 +576,7 @@ BackupSummary backup(const BackupOptions& options) {
         }
         cpu_workers.join();
         object_queue.close();
-        if (blob_writer.joinable()) blob_writer.join();
+        blob_writers.join();
         if (monitor_started) { monitor_stop.store(true, std::memory_order_relaxed); if (monitor.joinable()) monitor.join(); monitor_started = false; }
     };
 
@@ -586,7 +586,7 @@ BackupSummary backup(const BackupOptions& options) {
     try {
         
         {
-            blob_writer = std::thread([&] {
+            blob_writers.start(options.writer_workers, [&](std::size_t) {
                 try {
                     while (auto task = object_queue.pop(&errors.cancelled)) {
                         if (errors.cancelled.load(std::memory_order_relaxed)) {

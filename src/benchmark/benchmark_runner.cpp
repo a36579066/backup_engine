@@ -61,7 +61,7 @@ std::string system_name() {
 std::string run_benchmark(const BenchmarkOptions& options) {
     if (options.dataset.empty() || options.workers.empty() || options.schedulers.empty() || options.repeat == 0 || options.repeat > 1000)
         throw std::runtime_error("benchmark requires a dataset, worker counts, schedulers, and repeat in 1..1000");
-    if (options.writer_workers != 1)
+    if (options.writer_workers == 0 || options.writer_workers > 32)
         throw std::runtime_error("benchmark writer workers must be in 1..32");
     if (options.storage_format != "files-v1")
         throw std::runtime_error("benchmark storage format must be files-v1");

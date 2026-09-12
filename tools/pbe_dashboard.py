@@ -200,8 +200,8 @@ class BackupManager:
             raise ValueError("排程方式必須是 fixed 或 adaptive。")
         if not 1 <= workers <= 256:
             raise ValueError("Workers 必須介於 1 到 256。")
-        if writer_workers != 1:
-            raise ValueError("此階段只支援一個 Object Writer。")
+        if not 1 <= writer_workers <= 32:
+            raise ValueError("Object Writer 數量必須介於 1 到 32。")
         if not 3 <= memory_mib <= 1_048_576:
             raise ValueError("記憶體額度必須至少 3 MiB。")
 

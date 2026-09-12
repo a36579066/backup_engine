@@ -1,8 +1,8 @@
 # Parallel Backup & Deduplication Engine
 
-Reconstructed architecture milestone 1: CPU workers with one object writer.
+Reconstructed architecture milestone 2: Concurrent object-writer pool.
 
-Raw chunks pass through a bounded CPU queue for BLAKE3, deduplication and Zstd. One storage thread durably publishes loose objects. The coordinator commits SQLite references after acknowledgements. Only files-v1 and one writer are supported.
+A configurable pool of 1 to 32 storage workers durably publishes loose objects. CPU workers release admission before waiting for object ACKs. Only files-v1 is supported.
 
 The engine also includes restore/full verification, source-change checks, bounded memory credits, crash checkpoints, diagnostics, adaptive CPU admission, and benchmark tooling.
 

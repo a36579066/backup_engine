@@ -174,7 +174,7 @@ Usage:
            [--storage-format files-v1]
   pbe backup --repo PATH --source PATH [--workers N] [--memory-mib N]
              [--scheduler fixed|adaptive] [--max-workers N]
-             [--writer-workers 1]
+             [--writer-workers N]
              [--skip-unsupported] [--trust-metadata | --paranoid]
   pbe list --repo PATH
   pbe show --repo PATH --snapshot ID
@@ -184,7 +184,7 @@ Usage:
   pbe explain --repo PATH --run RUN_ID [--json]
   pbe benchmark --dataset PATH [--workers 1,2,4,8] [--repeat N]
                 [--compare-schedulers fixed,adaptive] [--memory-mib N]
-                [--writer-workers 1] [--storage-format files-v1]
+                [--writer-workers N] [--storage-format files-v1]
                 [--output PATH] [--test-writer-delay-ms N]
                 [--test-reader-delay-ms N] [--test-cpu-spin-ms N]
 
@@ -256,8 +256,8 @@ int run(int argc, char** argv) {
         options.workers = parse_size(optional(args, "--workers", "4"), "--workers");
         options.max_workers = parse_size(optional(args, "--max-workers", std::to_string(options.workers)), "--max-workers");
         options.writer_workers = parse_size(optional(args, "--writer-workers", "1"), "--writer-workers");
-        if (options.writer_workers != 1)
-            usage_error("--writer-workers must be 1 in this milestone");
+        if (options.writer_workers == 0 || options.writer_workers > 32)
+            usage_error("--writer-workers must be between 1 and 32");
         options.memory_mib = parse_size(optional(args, "--memory-mib", "256"), "--memory-mib");
         options.zstd_level = parse_int(optional(args, "--zstd-level", "3"), "--zstd-level");
         const auto scheduler = optional(args, "--scheduler", "fixed");
@@ -331,8 +331,8 @@ int run(int argc, char** argv) {
         pbe::BenchmarkOptions options;
         options.dataset = required(args, "--dataset");
         options.writer_workers = parse_size(optional(args, "--writer-workers", "1"), "--writer-workers");
-        if (options.writer_workers != 1)
-            usage_error("--writer-workers must be 1 in this milestone");
+        if (options.writer_workers == 0 || options.writer_workers > 32)
+            usage_error("--writer-workers must be between 1 and 32");
         options.workers = parse_workers(optional(args, "--workers", "1,2,4,8"));
         options.repeat = parse_size(optional(args, "--repeat", "5"), "--repeat");
         options.memory_mib = parse_size(optional(args, "--memory-mib", "256"), "--memory-mib");
