@@ -154,7 +154,7 @@ class BackupManager:
     def initialize(self, payload: dict[str, Any]) -> dict[str, Any]:
         repo = self._repo_path(str(payload.get("repo", "")))
         storage_format = str(payload.get("storage_format", "files-v1"))
-        if storage_format not in {"files-v1"}:
+        if storage_format not in {"files-v1", "pack-v2"}:
             raise ValueError("不支援的儲存格式。")
         if (repo / "catalog.sqlite").exists():
             raise ValueError("這個路徑已經是 PBE 儲存庫。")

@@ -171,7 +171,7 @@ void print_usage(std::ostream& out) {
 
 Usage:
   pbe init --repo PATH
-           [--storage-format files-v1]
+           [--storage-format files-v1|pack-v2]
   pbe backup --repo PATH --source PATH [--workers N] [--memory-mib N]
              [--scheduler fixed|adaptive] [--max-workers N]
              [--writer-workers N]
@@ -184,7 +184,7 @@ Usage:
   pbe explain --repo PATH --run RUN_ID [--json]
   pbe benchmark --dataset PATH [--workers 1,2,4,8] [--repeat N]
                 [--compare-schedulers fixed,adaptive] [--memory-mib N]
-                [--writer-workers N] [--storage-format files-v1]
+                [--writer-workers N] [--storage-format files-v1|pack-v2]
                 [--output PATH] [--test-writer-delay-ms N]
                 [--test-reader-delay-ms N] [--test-cpu-spin-ms N]
 

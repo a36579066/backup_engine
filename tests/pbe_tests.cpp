@@ -422,7 +422,57 @@ void parallel_object_writer_round_trip() {
     fs::remove_all(root);
 }
 
+void pack_v2_round_trip() {
+    const auto root = fs::temp_directory_path() / ("pbe-pack-v2-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const auto repo = root / "repo";
+    const auto source = root / "source";
+    const auto restored = root / "restored";
+    fs::create_directories(source);
+    std::vector<std::uint8_t> a(1u << 20, 'A');
+    std::vector<std::uint8_t> b(1u << 20, 'B');
+    std::vector<std::uint8_t> c(1u << 20);
+    for (std::size_t i = 0; i < c.size(); ++i) c[i] = static_cast<std::uint8_t>((i * 131u + i / 17u) & 0xffu);
+    std::vector<std::uint8_t> first_file;
+    first_file.insert(first_file.end(), a.begin(), a.end());
+    first_file.insert(first_file.end(), a.begin(), a.end());
+    first_file.insert(first_file.end(), b.begin(), b.end());
+    std::vector<std::uint8_t> second_file;
+    second_file.insert(second_file.end(), a.begin(), a.end());
+    second_file.insert(second_file.end(), c.begin(), c.end());
+    write_bytes(source / "first.bin", first_file);
+    write_bytes(source / "second.bin", second_file);
 
+    pbe::init_repository(repo, "pack-v2");
+    pbe::BackupOptions options;
+    options.repo = repo; options.source = source; options.workers = 4; options.writer_workers = 1; options.memory_mib = 8;
+    const auto first = pbe::backup(options);
+    check(first.memory_credit_peak_bytes <= options.memory_mib * 1024u * 1024u,
+          "pack batching holds memory credits within the configured budget");
+    check(first.unique_raw_bytes == 3u * (1u << 20) && first.reused_chunks == 2,
+          "in-flight duplicate chunks reuse the first durable pack object before metadata commit");
+    check(pbe::verify_snapshot(repo, first.id).bytes == first.logical_bytes,
+          "pack-v2 full verification checks object headers, locations, and content hashes");
+    const auto stats = pbe::repository_stats(repo);
+    check(stats.object_count == 3 && stats.referenced_objects == 3,
+          "pack-v2 catalog indexes each unique object exactly once");
+    bool found_pack = false;
+    for (const auto& item : fs::directory_iterator(repo / "objects" / "packs")) {
+        if (item.path().extension() == ".pack") found_pack = true;
+    }
+    check(found_pack, "pack-v2 publishes immutable pack files");
+    bool found_loose_object = false;
+    for (const auto& item : fs::recursive_directory_iterator(repo / "objects"))
+        if (item.path().extension() == ".obj") found_loose_object = true;
+    check(!found_loose_object, "pack-v2 stores objects in packs instead of per-object files");
+    pbe::restore_snapshot({repo, restored, first.id});
+    check(same_tree(source, restored), "pack-v2 restores the full source tree");
+
+    options.trust_metadata = true;
+    const auto second = pbe::backup(options);
+    check(second.read_bytes == 0 && pbe::verify_snapshot(repo, second.id).bytes == second.logical_bytes,
+          "pack-v2 trusted metadata cache reuses and verifies packed object locations");
+    fs::remove_all(root);
+}
 
 
 
@@ -713,7 +763,7 @@ void writer_failure_releases_duplicate_waiters() {
 }
 
 void crash_publish_matrix() {
-    for (const std::string storage_format : {"files-v1"}) {
+    for (const std::string storage_format : {"files-v1", "pack-v2"}) {
       for (const std::string failpoint : {"after-temp-write", "after-object-publish", "before-sqlite-batch-commit", "before-final-publish", "after-final-publish"}) {
         const auto root = fs::temp_directory_path() / ("pbe-crash-" + storage_format + "-" + failpoint + "-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
         const auto repo = root / "repo";
@@ -744,7 +794,24 @@ void crash_publish_matrix() {
         check(pbe::verify_snapshot(repo, recovered.id).bytes == (1u << 20), "next writer recovers and publishes after process crash");
         check(pbe::list_snapshots(repo).size() == (published ? 3u : 2u), "recovery exposes only complete snapshots");
         check(fs::is_empty(repo / "staging"), "recovery removes abandoned staging contents");
-        
+        if (storage_format == "pack-v2") {
+            sqlite3* db = nullptr;
+            check(sqlite3_open_v2((repo / "catalog.sqlite").c_str(), &db, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK,
+                  "open pack catalog after recovery");
+            sqlite3_stmt* statement = nullptr;
+            check(sqlite3_prepare_v2(db, "SELECT DISTINCT pack_id FROM objects WHERE pack_id IS NOT NULL", -1,
+                                     &statement, nullptr) == SQLITE_OK, "query indexed packs after recovery");
+            std::set<std::string> indexed, present;
+            while (sqlite3_step(statement) == SQLITE_ROW) {
+                const auto* value = sqlite3_column_text(statement, 0);
+                indexed.emplace(reinterpret_cast<const char*>(value));
+            }
+            sqlite3_finalize(statement);
+            sqlite3_close(db);
+            for (const auto& item : fs::directory_iterator(repo / "objects" / "packs"))
+                if (item.path().extension() == ".pack") present.insert(item.path().stem().string());
+            check(indexed == present, "recovery removes packs published before a catalog commit");
+        }
         fs::remove_all(root);
       }
     }
@@ -771,6 +838,8 @@ int main() {
         backup_round_trip();
         std::cout << "[TEST] parallel_object_writer_round_trip\n" << std::flush;
         parallel_object_writer_round_trip();
+        std::cout << "[TEST] pack_v2_round_trip\n" << std::flush;
+        pack_v2_round_trip();
         std::cout << "[TEST] chunk_boundaries\n" << std::flush;
         chunk_boundaries();
         std::cout << "[TEST] codec_fallback_round_trip\n" << std::flush;

@@ -63,8 +63,8 @@ std::string run_benchmark(const BenchmarkOptions& options) {
         throw std::runtime_error("benchmark requires a dataset, worker counts, schedulers, and repeat in 1..1000");
     if (options.writer_workers == 0 || options.writer_workers > 32)
         throw std::runtime_error("benchmark writer workers must be in 1..32");
-    if (options.storage_format != "files-v1")
-        throw std::runtime_error("benchmark storage format must be files-v1");
+    if (options.storage_format != "files-v1" && options.storage_format != "pack-v2")
+        throw std::runtime_error("benchmark storage format must be files-v1 or pack-v2");
     const auto dataset = canonical_existing(options.dataset);
     if (!std::filesystem::is_directory(dataset)) throw std::runtime_error("benchmark dataset must be a directory");
     for (const auto workers : options.workers) if (!workers || workers > 256) throw std::runtime_error("benchmark workers must be in 1..256");

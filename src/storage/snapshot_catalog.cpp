@@ -57,15 +57,32 @@ SnapshotSummary query_snapshot(sqlite3* db, const std::string& snapshot) {
         static_cast<std::uint64_t>(statement.i64(7))};
 }
 
-std::vector<ChunkRef> load_chunks(sqlite3* db, const std::string& snapshot, const std::string& path) {
-    Statement statement(db, "SELECT ordinal,chunk_bytes,object_id FROM entry_chunks WHERE snapshot_id=? AND relative_path=? ORDER BY ordinal");
+std::vector<ChunkRef> load_chunks(sqlite3* db, const std::string& snapshot, const std::string& path,
+                                  bool packed_storage) {
+    Statement statement(db, packed_storage
+        ? "SELECT c.ordinal,c.object_id,c.chunk_bytes,o.pack_id,o.pack_offset FROM entry_chunks c JOIN objects o ON o.object_id=c.object_id WHERE c.snapshot_id=? AND c.relative_path=? ORDER BY c.ordinal"
+        : "SELECT ordinal,object_id,chunk_bytes FROM entry_chunks WHERE snapshot_id=? AND relative_path=? ORDER BY ordinal");
     statement.text(1, snapshot); statement.text(2, path);
     std::vector<ChunkRef> chunks;
-    while (statement.row()) chunks.push_back(ChunkRef{static_cast<std::uint64_t>(statement.i64(0)), static_cast<std::uint64_t>(statement.i64(1)), statement.string(2), {}});
+    while (statement.row()) {
+        ChunkRef ref{static_cast<std::uint64_t>(statement.i64(0)), static_cast<std::uint64_t>(statement.i64(2)), statement.string(1), {}};
+        if (packed_storage) {
+            if (statement.is_null(3) || statement.is_null(4)) throw std::runtime_error("packed object is missing its catalog location");
+            ref.location = ObjectLocation{statement.string(3), static_cast<std::uint64_t>(statement.i64(4))};
+        }
+        chunks.push_back(std::move(ref));
+    }
     return chunks;
 }
 
-
+std::optional<ObjectLocation> lookup_object_location(sqlite3* db, const std::string& object_id) {
+    Statement statement(db, "SELECT pack_id,pack_offset FROM objects WHERE object_id=?");
+    statement.text(1, object_id);
+    if (!statement.row()) return std::nullopt;
+    if (statement.is_null(0) || statement.is_null(1))
+        throw std::runtime_error("object catalog row is missing its pack location: " + object_id);
+    return ObjectLocation{statement.string(0), static_cast<std::uint64_t>(statement.i64(1))};
+}
 
 void ensure_chunk_layout(sqlite3* db, const std::string& snapshot) {
     Statement statement(db,

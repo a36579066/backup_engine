@@ -75,15 +75,17 @@ std::string random_temp_name() {
 
 void create_file_at(int parent_fd, const std::string& name, sqlite3* db,
                     const std::filesystem::path& repo, const std::string& snapshot,
-                    const DbEntry& entry) {
+                    const DbEntry& entry, bool packed_storage) {
     const std::string temp = random_temp_name();
     int fd = ::openat(parent_fd, temp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0) throw std::runtime_error(error_text("create restore temporary file"));
     try {
         std::uint64_t total = 0;
-        for (const auto& ref : load_chunks(db, snapshot, entry.path)) {
+        for (const auto& ref : load_chunks(db, snapshot, entry.path, packed_storage)) {
             if (ref.ordinal != total / kChunkSize || ref.bytes > kChunkSize) throw std::runtime_error("invalid chunk ordering or length in catalog");
-            auto raw = read_object(object_path(repo, ref.object_id), ref.object_id);
+            auto raw = packed_storage
+                ? pbe::detail::read_packed_object(repo, ref.location, ref.object_id)
+                : read_object(object_path(repo, ref.object_id), ref.object_id);
             if (raw.size() != ref.bytes) throw std::runtime_error("chunk size differs from catalog");
             write_all(fd, raw.data(), raw.size());
             total += raw.size();
@@ -111,6 +113,7 @@ void restore_snapshot(const RestoreOptions& options) {
     if (options.target.empty()) throw std::runtime_error("restore requires --target");
     validate_repo(options.repo);
     const auto repo = canonical_existing(options.repo);
+    const bool packed_storage = pbe::detail::repository_format_version(repo) == 2;
     Catalog catalog(repo / "catalog.sqlite");
     require_complete(catalog.get(), options.snapshot);
     const auto entries = load_entries(catalog.get(), options.snapshot);
@@ -157,7 +160,7 @@ void restore_snapshot(const RestoreOptions& options) {
         for (const auto& entry : files) {
             const auto parts = path_parts(entry.path);
             int parent = open_directory_path(root_fd, parts, parts.size() - 1);
-            try { create_file_at(parent, parts.back(), catalog.get(), repo, options.snapshot, entry); }
+            try { create_file_at(parent, parts.back(), catalog.get(), repo, options.snapshot, entry, packed_storage); }
             catch (...) { ::close(parent); throw; }
             ::close(parent);
         }

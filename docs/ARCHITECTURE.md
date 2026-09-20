@@ -1,5 +1,5 @@
-# Milestone 2: Concurrent object-writer pool
+# Milestone 3: Memory-bounded batch packs
 
-A configurable pool of 1 to 32 storage workers durably publishes loose objects. CPU workers release admission before waiting for object ACKs. Only files-v1 is supported.
+Pack-v2 collects a bounded in-memory batch, writes its objects to one immutable pack, and acknowledges the batch after durable publication. Batch size is derived from the memory credit capacity. Files-v1 remains supported.
 
 The reader/coordinator, CPU workers, and storage stage use bounded queues, RAII credits, explicit cancellation, and close/join cleanup. SQLite references are committed only after durable ACKs.

@@ -18,7 +18,7 @@ def main() -> None:
     parser.add_argument("--small-files", type=int, default=1000)
     parser.add_argument("--repeat", type=int, default=5)
     parser.add_argument("--writer-workers", type=int, default=1, help="number of concurrent object writers")
-    parser.add_argument("--storage-format", choices=("files-v1",), default="files-v1")
+    parser.add_argument("--storage-format", choices=("files-v1", "pack-v2"), default="files-v1")
     parser.add_argument("--memory-mib", type=int, default=256)
     parser.add_argument("--seed", type=int, default=20261101)
     parser.add_argument("--test-cpu-spin-ms", type=int, default=0,

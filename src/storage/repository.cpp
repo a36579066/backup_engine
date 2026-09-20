@@ -51,9 +51,10 @@ RepoConfig read_config(const std::filesystem::path& repo) {
         }
     }
     if (!format_seen || !chunk_seen || !hash_seen) throw std::runtime_error("repository config is incomplete");
-    if (config.format_version != 1)
+    if (config.format_version != 1 && config.format_version != 2)
         throw std::runtime_error("unsupported repository format version " + std::to_string(config.format_version));
-    if (config.storage_format != "files-v1")
+    if ((config.format_version == 1 && config.storage_format != "files-v1") ||
+        (config.format_version == 2 && config.storage_format != "pack-v2"))
         throw std::runtime_error("repository format version and storage format do not match");
     if (config.chunk_size != kChunkSize || config.hash_algorithm != "blake3-256") throw std::runtime_error("unsupported repository chunk/hash configuration");
     return config;

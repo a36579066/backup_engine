@@ -28,6 +28,8 @@ std::vector<std::string> path_parts(const std::string& relative);
 std::vector<DbEntry> load_entries(sqlite3* db, const std::string& snapshot);
 std::string require_complete(sqlite3* db, const std::string& snapshot);
 SnapshotSummary query_snapshot(sqlite3* db, const std::string& snapshot);
-std::vector<ChunkRef> load_chunks(sqlite3* db, const std::string& snapshot, const std::string& path);
+std::vector<ChunkRef> load_chunks(sqlite3* db, const std::string& snapshot, const std::string& path,
+                                  bool packed_storage = false);
+std::optional<ObjectLocation> lookup_object_location(sqlite3* db, const std::string& object_id);
 void ensure_chunk_layout(sqlite3* db, const std::string& snapshot);
 } // namespace pbe::detail

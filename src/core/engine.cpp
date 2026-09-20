@@ -393,7 +393,26 @@ void recover_incomplete(sqlite3* db, const std::filesystem::path& repo) {
             ec.clear();
         }
     }
-    
+    if (detail::repository_format_version(repo) == 2) {
+        std::set<std::string> referenced_packs;
+        Statement packs(db, "SELECT DISTINCT pack_id FROM objects WHERE pack_id IS NOT NULL");
+        while (packs.row()) referenced_packs.insert(packs.string(0));
+        const auto pack_dir = repo / "objects" / "packs";
+        bool removed_orphan = false;
+        if (std::filesystem::exists(pack_dir, ec)) {
+            for (std::filesystem::directory_iterator it(pack_dir, ec), end; !ec && it != end; it.increment(ec)) {
+                const auto status = it->symlink_status(ec);
+                if (ec) break;
+                if (!std::filesystem::is_regular_file(status) || it->path().extension() != ".pack") continue;
+                const std::string pack_id = it->path().stem().string();
+                if (referenced_packs.contains(pack_id)) continue;
+                if (std::filesystem::remove(it->path(), ec)) removed_orphan = true;
+                if (ec) break;
+            }
+            if (ec) throw std::runtime_error("cannot scan object packs during recovery: " + ec.message());
+        }
+        if (removed_orphan) fsync_directory(pack_dir);
+    }
 }
 
 void insert_chunk_batch(sqlite3* db, const std::string& snapshot, const std::string& path,
@@ -462,8 +481,8 @@ void snapshot_entry_transaction(sqlite3* db, const std::string& snapshot,
 
 void init_repository(const std::filesystem::path& input, const std::string& storage_format) {
     if (input.empty()) throw std::runtime_error("--repo is required");
-    if (storage_format != "files-v1")
-        throw std::runtime_error("this milestone supports files-v1 storage only");
+    if (storage_format != "files-v1" && storage_format != "pack-v2")
+        throw std::runtime_error("storage format must be files-v1 or pack-v2");
     std::error_code ec;
     auto repo = std::filesystem::absolute(input, ec).lexically_normal();
     if (ec) throw std::runtime_error("cannot resolve repository path: " + ec.message());
@@ -476,12 +495,13 @@ void init_repository(const std::filesystem::path& input, const std::string& stor
     if (!created && std::filesystem::directory_iterator(repo) != std::filesystem::directory_iterator{})
         throw std::runtime_error("refusing to initialize a non-empty directory");
     std::filesystem::create_directories(repo / "objects");
+    if (storage_format == "pack-v2") std::filesystem::create_directories(repo / "objects" / "packs");
     std::filesystem::create_directories(repo / "staging");
     std::filesystem::create_directories(repo / "reports");
     {
         std::ofstream config(repo / "repo.toml", std::ios::binary | std::ios::out | std::ios::trunc);
         if (!config) throw std::runtime_error("cannot create repository config");
-        config << "format_version = " << 1
+        config << "format_version = " << (storage_format == "pack-v2" ? 2 : 1)
                << "\nchunk_size = 1048576\nhash_algorithm = \"blake3-256\"\nobject_format = 1\nstorage_format = \""
                << storage_format << "\"\n";
         config.flush();
@@ -495,7 +515,10 @@ void init_repository(const std::filesystem::path& input, const std::string& stor
         Catalog catalog(repo / "catalog.sqlite", true);
         create_schema(catalog.get());
     }
-    
+    if (storage_format == "pack-v2") {
+        fsync_directory(repo / "objects" / "packs");
+        fsync_directory(repo / "objects");
+    }
     int lockfd = ::open((repo / ".repo.lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (lockfd >= 0) { ::fsync(lockfd); ::close(lockfd); }
     fsync_directory(repo);
@@ -505,6 +528,7 @@ BackupSummary backup(const BackupOptions& options) {
     if (options.repo.empty() || options.source.empty()) throw std::runtime_error("backup requires --repo and --source");
     validate_repo(options.repo);
     const auto repo = canonical_existing(options.repo);
+    const bool packed_storage = detail::repository_format_version(repo) == 2;
     const auto source = canonical_existing(options.source);
     if (!std::filesystem::is_directory(source)) throw std::runtime_error("backup source must be a directory");
     if (path_within(repo, source) || path_within(source, repo))
@@ -545,11 +569,19 @@ BackupSummary backup(const BackupOptions& options) {
     const auto start = Clock::now();
     const std::size_t buffer_budget = options.memory_mib * (std::size_t(1) << 20);
     const std::size_t credit_per_chunk = kChunkSize + ZSTD_compressBound(kChunkSize);
-    const std::size_t coordinator_batch_size = std::max<std::size_t>(8, workers_count * 4);
+    const std::size_t credit_capacity = std::max<std::size_t>(1, buffer_budget / credit_per_chunk);
+    const std::size_t credits_per_pack_writer = credit_capacity > 1
+        ? std::max<std::size_t>(1, (credit_capacity - 1) / options.writer_workers) : 1;
+    const std::size_t pack_batch_limit = std::min<std::size_t>(64, credits_per_pack_writer);
+    const std::size_t coordinator_batch_size = packed_storage
+        ? std::max<std::size_t>(8, pack_batch_limit * options.writer_workers)
+        : std::max<std::size_t>(8, workers_count * 4);
     MemoryBudget memory(buffer_budget);
     ActiveWorkerGate gate(workers_count, options.adaptive ? 1 : workers_count);
     const std::size_t input_queue_capacity = std::max<std::size_t>(2, workers_count * 2);
-    const std::size_t object_queue_capacity = input_queue_capacity;
+    const std::size_t object_queue_capacity = packed_storage
+        ? std::max(input_queue_capacity, coordinator_batch_size)
+        : input_queue_capacity;
     BoundedQueue<ChunkTask> input_queue(input_queue_capacity);
     BoundedQueue<BlobWriteTask> object_queue(object_queue_capacity);
     ClaimRegistry<ObjectHeader> claims;
@@ -559,6 +591,7 @@ BackupSummary backup(const BackupOptions& options) {
     metrics.process_rss_peak_bytes.store(current_rss_bytes(), std::memory_order_relaxed);
     FixedWorkerPool cpu_workers;
     FixedWorkerPool blob_writers;
+    std::vector<std::unique_ptr<Catalog>> object_index_readers;
     std::thread monitor;
     std::atomic<bool> monitor_stop{false};
     bool monitor_started = false;
@@ -584,8 +617,68 @@ BackupSummary backup(const BackupOptions& options) {
     if (!trace) std::cerr << "warning: decision trace could not be opened; backup correctness is unaffected\n";
 
     try {
-        
-        {
+        if (packed_storage) {
+            object_index_readers.reserve(workers_count);
+            for (std::size_t i = 0; i < workers_count; ++i)
+                object_index_readers.push_back(std::make_unique<Catalog>(repo / "catalog.sqlite"));
+        }
+        if (packed_storage) {
+            blob_writers.start(options.writer_workers, [&](std::size_t) {
+                std::vector<BlobWriteTask> segment;
+                std::vector<WriteAck> acknowledgements;
+                segment.reserve(pack_batch_limit);
+                acknowledgements.reserve(pack_batch_limit);
+                try {
+                    while (auto first = object_queue.pop()) {
+                        segment.clear();
+                        segment.push_back(std::move(*first));
+                        const auto deadline = Clock::now() + std::chrono::milliseconds(2);
+                        while (segment.size() < pack_batch_limit) {
+                            auto next = object_queue.pop_until(deadline);
+                            if (!next) break;
+                            segment.push_back(std::move(*next));
+                        }
+                        const auto write_begin = Clock::now();
+                        detail::ObjectWriteTimings write_timings;
+                        bool timings_recorded = false;
+                        try {
+                            if (errors.cancelled.load(std::memory_order_relaxed))
+                                throw std::runtime_error("backup cancelled");
+                            if (!sleep_cancellable(options.test_writer_delay_ms, errors.cancelled))
+                                throw std::runtime_error("backup cancelled");
+                            std::vector<BlobWriteTask*> tasks;
+                            tasks.reserve(segment.size());
+                            for (auto& task : segment) tasks.push_back(&task);
+                            acknowledgements = detail::write_pack(repo, job_id, tasks, options.failpoint, &write_timings);
+                            record_object_write(metrics, write_timings);
+                            timings_recorded = true;
+                            metrics.object_write_operation_count.fetch_add(1, std::memory_order_relaxed);
+                            metrics.object_write_count.fetch_add(acknowledgements.size(), std::memory_order_relaxed);
+                            for (const auto& ack : acknowledgements) {
+                                if (ack.new_object) metrics.new_stored_bytes.fetch_add(ack.header.stored_bytes + kObjectHeaderSize, std::memory_order_relaxed);
+                                if (ack.new_object) metrics.completed_unique_raw_bytes.fetch_add(ack.header.raw_bytes, std::memory_order_relaxed);
+                            }
+                            metrics.writer_busy_ns.fetch_add(elapsed_ns(write_begin), std::memory_order_relaxed);
+                            for (std::size_t i = 0; i < segment.size(); ++i) {
+                                if (segment[i].completion) segment[i].completion(&acknowledgements[i], {});
+                                else if (segment[i].promise) segment[i].promise->set_value(acknowledgements[i]);
+                            }
+                        } catch (...) {
+                            const auto error = std::current_exception();
+                            if (!timings_recorded) record_object_write(metrics, write_timings);
+                            metrics.writer_busy_ns.fetch_add(elapsed_ns(write_begin), std::memory_order_relaxed);
+                            for (auto& task : segment) {
+                                try {
+                                    if (task.completion) task.completion(nullptr, error);
+                                    else if (task.promise) task.promise->set_exception(error);
+                                } catch (...) {}
+                            }
+                            fail(error);
+                        }
+                    }
+                } catch (...) { fail(std::current_exception()); }
+            });
+        } else {
             blob_writers.start(options.writer_workers, [&](std::size_t) {
                 try {
                     while (auto task = object_queue.pop(&errors.cancelled)) {
@@ -621,7 +714,8 @@ BackupSummary backup(const BackupOptions& options) {
             });
         }
 
-        cpu_workers.start(workers_count, [&](std::size_t) {
+        cpu_workers.start(workers_count, [&](std::size_t i) {
+                sqlite3* worker_catalog = packed_storage ? object_index_readers.at(i)->get() : nullptr;
                 while (auto item = input_queue.pop(&errors.cancelled)) {
                     ChunkTask task = std::move(*item);
                     std::shared_ptr<ClaimRegistry<ObjectHeader>::State> owner_state;
@@ -647,9 +741,19 @@ BackupSummary backup(const BackupOptions& options) {
                             throw std::runtime_error("backup cancelled during controlled CPU work");
                         const std::string id = digest_hex(digest);
                         ObjectHeader existing_header;
+                        ObjectLocation existing_location;
                         std::filesystem::path stored_path;
                         bool object_exists = false;
-                        {
+                        if (packed_storage) {
+                            auto location = detail::lookup_object_location(worker_catalog, id);
+                            if (location) {
+                                existing_location = *location;
+                                const auto header_begin = Clock::now();
+                                existing_header = detail::read_packed_object_header(repo, existing_location);
+                                metrics.object_io_ns.fetch_add(elapsed_ns(header_begin), std::memory_order_relaxed);
+                                object_exists = true;
+                            }
+                        } else {
                             stored_path = object_path(repo, id);
                             if (std::filesystem::exists(stored_path)) {
                                 const auto header_begin = Clock::now();
@@ -667,7 +771,9 @@ BackupSummary backup(const BackupOptions& options) {
                             std::vector<std::uint8_t>().swap(task.raw);
                             if (verify_existing) {
                                 ObjectReadTimings timings;
-                                const auto verified_raw = read_object(stored_path, id, &timings);
+                                const auto verified_raw = packed_storage
+                                    ? detail::read_packed_object(repo, existing_location, id, &timings)
+                                    : read_object(stored_path, id, &timings);
                                 if (verified_raw.size() != raw_size) throw std::runtime_error("existing object content length differs from its digest");
                                 record_object_read(metrics, timings);
                             }
@@ -717,7 +823,36 @@ BackupSummary backup(const BackupOptions& options) {
                         }
                         gate.release(); permit = false;
                         const auto queue_begin = Clock::now();
-                        
+                        if (packed_storage) {
+                            auto retained_credit = std::make_shared<MemoryBudget::Credit>(std::move(task.credit));
+                            const auto ack_begin = Clock::now();
+                            const auto promise = task.promise;
+                            blob.retained_credit = std::move(retained_credit);
+                            blob.completion = [&, claim_id, owner_state, promise, ack_begin](
+                                const WriteAck* ack, std::exception_ptr error) {
+                                const auto ack_wait = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - ack_begin).count();
+                                metrics.writer_ack_wait_ns.fetch_add(ack_wait, std::memory_order_relaxed);
+                                metrics.output_wait_ns.fetch_add(ack_wait, std::memory_order_relaxed);
+                                if (error || !ack) {
+                                    const auto failure = error ? error : std::make_exception_ptr(
+                                        std::runtime_error("pack writer returned no acknowledgement"));
+                                    claims.fail(claim_id, owner_state, failure);
+                                    try { promise->set_exception(failure); } catch (...) {}
+                                    return;
+                                }
+                                claims.complete(claim_id, owner_state, ack->header);
+                                metrics.completed_chunks.fetch_add(1, std::memory_order_relaxed);
+                                metrics.completed_raw_bytes.fetch_add(ack->header.raw_bytes, std::memory_order_relaxed);
+                                try { promise->set_value(ack->header); } catch (...) {}
+                            };
+                            const bool queued = object_queue.push(std::move(blob), &errors.cancelled);
+                            metrics.output_wait_ns.fetch_add(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - queue_begin).count(),
+                                std::memory_order_relaxed);
+                            if (!queued) throw std::runtime_error("object writer queue closed during backup");
+                            is_owner = false; // The asynchronous completion now owns the claim and coordinator promise.
+                            continue;
+                        }
                         const bool queued = object_queue.push(std::move(blob), &errors.cancelled);
                         metrics.output_wait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - queue_begin).count(), std::memory_order_relaxed);
                         if (!queued) throw std::runtime_error("object writer queue closed during backup");
@@ -921,14 +1056,20 @@ BackupSummary backup(const BackupOptions& options) {
                 for (;;) {
                     std::vector<ChunkRef> refs;
                     {
-                        const char* query_sql = "SELECT ordinal,object_id,chunk_bytes FROM entry_chunks WHERE snapshot_id=? AND relative_path=? AND ordinal>=? ORDER BY ordinal LIMIT ?";
+                        const char* query_sql = packed_storage
+                            ? "SELECT c.ordinal,c.object_id,c.chunk_bytes,o.pack_id,o.pack_offset FROM entry_chunks c JOIN objects o ON o.object_id=c.object_id WHERE c.snapshot_id=? AND c.relative_path=? AND c.ordinal>=? ORDER BY c.ordinal LIMIT ?"
+                            : "SELECT ordinal,object_id,chunk_bytes FROM entry_chunks WHERE snapshot_id=? AND relative_path=? AND ordinal>=? ORDER BY ordinal LIMIT ?";
                         Statement query(catalog.get(), query_sql);
                         query.text(1, previous_snapshot); query.text(2, entry.relative);
                         query.integer(3, static_cast<std::int64_t>(next_ordinal)); query.integer(4, cache_batch_size);
                         while (query.row()) {
                             ChunkRef ref{static_cast<std::uint64_t>(query.i64(0)),
                                 static_cast<std::uint64_t>(query.i64(2)), query.string(1), {}};
-                            
+                            if (packed_storage) {
+                                if (query.is_null(3) || query.is_null(4))
+                                    throw std::runtime_error("cached packed object is missing its catalog location");
+                                ref.location = ObjectLocation{query.string(3), static_cast<std::uint64_t>(query.i64(4))};
+                            }
                             refs.push_back(std::move(ref));
                         }
                     }
@@ -942,7 +1083,9 @@ BackupSummary backup(const BackupOptions& options) {
                         if (ref.ordinal != expected_ordinal || expected_bytes == 0 || ref.bytes != expected_bytes)
                             throw std::runtime_error("cached chunk map is invalid for " + entry.relative);
                         const auto header_begin = Clock::now();
-                        auto header = read_object_header(object_path(repo, ref.object_id));
+                        auto header = packed_storage
+                            ? detail::read_packed_object_header(repo, ref.location)
+                            : read_object_header(object_path(repo, ref.object_id));
                         metrics.object_io_ns.fetch_add(elapsed_ns(header_begin), std::memory_order_relaxed);
                         if (header.raw_bytes != ref.bytes || digest_hex(header.digest) != ref.object_id)
                             throw std::runtime_error("cached object metadata mismatch");
@@ -952,7 +1095,9 @@ BackupSummary backup(const BackupOptions& options) {
                             try {
                                 auto credit = memory.acquire(credit_per_chunk, errors.cancelled);
                                 ObjectReadTimings timings;
-                                const auto raw = read_object(object_path(repo, ref.object_id), ref.object_id, &timings);
+                                const auto raw = packed_storage
+                                    ? detail::read_packed_object(repo, ref.location, ref.object_id, &timings)
+                                    : read_object(object_path(repo, ref.object_id), ref.object_id, &timings);
                                 record_object_read(metrics, timings);
                                 if (raw.size() != ref.bytes)
                                     throw std::runtime_error("cached object content length mismatch");
@@ -1134,6 +1279,7 @@ SnapshotSummary show_snapshot(const std::filesystem::path& repo_input, const std
 VerifySummary verify_snapshot(const std::filesystem::path& repo_input, const std::string& snapshot) {
     validate_repo(repo_input);
     const auto repo = canonical_existing(repo_input);
+    const bool packed_storage = detail::repository_format_version(repo) == 2;
     Catalog catalog(repo / "catalog.sqlite");
     require_complete(catalog.get(), snapshot);
     exec(catalog.get(), "PRAGMA foreign_keys=ON;");
@@ -1151,7 +1297,7 @@ VerifySummary verify_snapshot(const std::filesystem::path& repo_input, const std
         }
         if (entry.kind != "file") throw std::runtime_error("unknown entry kind in catalog");
         ++result.files;
-        const auto refs = load_chunks(catalog.get(), snapshot, entry.path);
+        const auto refs = load_chunks(catalog.get(), snapshot, entry.path, packed_storage);
         std::uint64_t total = 0;
         for (std::size_t i = 0; i < refs.size(); ++i) {
             const auto& ref = refs[i];
@@ -1162,17 +1308,25 @@ VerifySummary verify_snapshot(const std::filesystem::path& repo_input, const std
             if (verified != verified_objects.end()) {
                 if (verified->second != ref.bytes) throw std::runtime_error("one object is referenced with inconsistent raw lengths: " + ref.object_id);
             } else {
-                const auto path = object_path(repo, ref.object_id);
-                const auto header = read_object_header(path);
+                const ObjectHeader header = packed_storage
+                    ? detail::read_packed_object_header(repo, ref.location)
+                    : read_object_header(object_path(repo, ref.object_id));
                 if (header.raw_bytes != ref.bytes) throw std::runtime_error("object and reference length differ: " + ref.object_id);
-                Statement row(catalog.get(), "SELECT raw_bytes,stored_bytes,codec FROM objects WHERE object_id=?");
-                row.text(1, ref.object_id);
-                if (!row.row() || static_cast<std::uint64_t>(row.i64(0)) != header.raw_bytes ||
-                    static_cast<std::uint64_t>(row.i64(1)) != header.stored_bytes ||
-                    row.string(2) != (header.codec ? "zstd" : "raw"))
+                Statement object_row(catalog.get(), packed_storage
+                    ? "SELECT raw_bytes,stored_bytes,codec,pack_id,pack_offset FROM objects WHERE object_id=?"
+                    : "SELECT raw_bytes,stored_bytes,codec FROM objects WHERE object_id=?");
+                object_row.text(1, ref.object_id);
+                if (!object_row.row() || static_cast<std::uint64_t>(object_row.i64(0)) != header.raw_bytes ||
+                    static_cast<std::uint64_t>(object_row.i64(1)) != header.stored_bytes ||
+                    object_row.string(2) != (header.codec ? "zstd" : "raw") ||
+                    (packed_storage && (object_row.is_null(3) || object_row.is_null(4) ||
+                        object_row.string(3) != ref.location.pack_id ||
+                        static_cast<std::uint64_t>(object_row.i64(4)) != ref.location.pack_offset)))
                     throw std::runtime_error("catalog object metadata differs from object header: " + ref.object_id);
-                if (read_object(path, ref.object_id).size() != ref.bytes)
-                    throw std::runtime_error("object and reference length differ: " + ref.object_id);
+                const auto raw = packed_storage
+                    ? detail::read_packed_object(repo, ref.location, ref.object_id)
+                    : read_object(object_path(repo, ref.object_id), ref.object_id);
+                if (raw.size() != ref.bytes) throw std::runtime_error("object and reference length differ: " + ref.object_id);
                 verified_objects.emplace(ref.object_id, ref.bytes);
             }
             total += ref.bytes;
@@ -1188,27 +1342,32 @@ VerifySummary verify_snapshot(const std::filesystem::path& repo_input, const std
 RepositoryStats repository_stats(const std::filesystem::path& repo_input) {
     validate_repo(repo_input);
     const auto repo = canonical_existing(repo_input);
+    const bool packed_storage = detail::repository_format_version(repo) == 2;
     Catalog catalog(repo / "catalog.sqlite");
     RepositoryStats stats;
     {
-        Statement query(catalog.get(), "SELECT COUNT(*) FROM snapshots WHERE status='COMPLETE'");
-        if (query.row()) stats.snapshots = static_cast<std::uint64_t>(query.i64(0));
+        Statement statement(catalog.get(), "SELECT COUNT(*) FROM snapshots WHERE status='COMPLETE'");
+        if (statement.row()) stats.snapshots = static_cast<std::uint64_t>(statement.i64(0));
     }
     {
-        Statement query(catalog.get(), "SELECT COALESCE(SUM(e.size_bytes),0) FROM entries e JOIN snapshots s ON s.id=e.snapshot_id WHERE s.status='COMPLETE' AND e.kind='file'");
-        if (query.row()) stats.logical_bytes = static_cast<std::uint64_t>(query.i64(0));
+        Statement statement(catalog.get(), "SELECT COALESCE(SUM(e.size_bytes),0) FROM entries e JOIN snapshots s ON s.id=e.snapshot_id WHERE s.status='COMPLETE' AND e.kind='file'");
+        if (statement.row()) stats.logical_bytes = static_cast<std::uint64_t>(statement.i64(0));
     }
     {
-        Statement query(catalog.get(), "SELECT COUNT(DISTINCT c.object_id) FROM entry_chunks c JOIN snapshots s ON s.id=c.snapshot_id WHERE s.status='COMPLETE'");
-        if (query.row()) stats.referenced_objects = static_cast<std::uint64_t>(query.i64(0));
+        Statement statement(catalog.get(), "SELECT COUNT(DISTINCT c.object_id) FROM entry_chunks c JOIN snapshots s ON s.id=c.snapshot_id WHERE s.status='COMPLETE'");
+        if (statement.row()) stats.referenced_objects = static_cast<std::uint64_t>(statement.i64(0));
+    }
+    if (packed_storage) {
+        Statement statement(catalog.get(), "SELECT COUNT(*) FROM objects");
+        if (statement.row()) stats.object_count = static_cast<std::uint64_t>(statement.i64(0));
     }
     std::error_code ec;
-    const auto objects = repo / "objects";
-    if (std::filesystem::exists(objects, ec)) {
-        for (std::filesystem::recursive_directory_iterator it(objects, ec), end; it != end; it.increment(ec)) {
+    const auto root = repo / "objects";
+    if (std::filesystem::exists(root, ec)) {
+        for (std::filesystem::recursive_directory_iterator it(root, std::filesystem::directory_options::skip_permission_denied, ec), end; it != end; it.increment(ec)) {
             if (ec) { ec.clear(); continue; }
-            if (!it->is_regular_file(ec) || it->path().extension() != ".obj") continue;
-            ++stats.object_count;
+            if (!it->is_regular_file(ec) || it->path().extension() != (packed_storage ? ".pack" : ".obj")) continue;
+            if (!packed_storage) ++stats.object_count;
             const auto size = it->file_size(ec);
             if (!ec) stats.physical_bytes += size;
             else ec.clear();

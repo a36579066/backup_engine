@@ -97,6 +97,40 @@ def main() -> None:
             raise AssertionError("restored tree differs from source")
         run(pbe, "restore", "--repo", str(repo), "--snapshot", snapshot_id, "--target", str(target), expected=2)
 
+        pack_repo, pack_target = root / "pack-repo", root / "pack-restore"
+        run(pbe, "init", "--repo", str(pack_repo), "--storage-format", "pack-v2")
+        packed = run(
+            pbe,
+            "backup",
+            "--repo",
+            str(pack_repo),
+            "--source",
+            str(source),
+            "--workers",
+            "2",
+            "--writer-workers",
+            "1",
+            "--memory-mib",
+            "8",
+        )
+        packed_snapshot = re.search(r"^Snapshot:\s+(\S+)$", packed, re.MULTILINE)
+        if not packed_snapshot:
+            raise AssertionError(f"pack-v2 backup omitted snapshot id:\n{packed}")
+        packed_id = packed_snapshot.group(1)
+        run(pbe, "verify", "--repo", str(pack_repo), "--snapshot", packed_id, "--full")
+        run(pbe, "restore", "--repo", str(pack_repo), "--snapshot", packed_id, "--target", str(pack_target))
+        if tree_signature(pack_target) != expected_tree:
+            raise AssertionError("pack-v2 restored tree differs from source")
+        if not list((pack_repo / "objects" / "packs").glob("*.pack")):
+            raise AssertionError("pack-v2 repository did not publish a pack file")
+        if list((pack_repo / "objects").rglob("*.obj")):
+            raise AssertionError("pack-v2 wrote loose per-object files")
+
+        dashboard_pack_repo = root / "dashboard-pack-repo"
+        BackupManager(pbe).initialize({"repo": str(dashboard_pack_repo), "storage_format": "pack-v2"})
+        dashboard_repository = read_repository(dashboard_pack_repo)
+        if dashboard_repository["storage_format"] != "pack-v2":
+            raise AssertionError("dashboard repository setup did not preserve the selected storage format")
         run(pbe, "show", "--repo", str(repo), "--snapshot", "missing-snapshot", expected=2)
         run(pbe, "backup", "--repo", str(repo), "--source", str(source), "--scheduler", "invalid", expected=2)
         run(pbe, "backup", "--repo", str(repo), "--source", str(root), expected=2)
@@ -118,6 +152,27 @@ def main() -> None:
         )
         if not all((benchmark_output / name).is_file() for name in ("benchmark.csv", "benchmark.json", "benchmark.md")):
             raise AssertionError("benchmark command omitted one or more report artifacts")
+        pack_benchmark_output = root / "pack-benchmark-output"
+        run(
+            pbe,
+            "benchmark",
+            "--dataset",
+            str(source),
+            "--workers",
+            "1",
+            "--repeat",
+            "1",
+            "--memory-mib",
+            "8",
+            "--storage-format",
+            "pack-v2",
+            "--output",
+            str(pack_benchmark_output),
+        )
+        pack_benchmark = json.loads((pack_benchmark_output / "benchmark.json").read_text(encoding="utf-8"))
+        if pack_benchmark["storage_format"] != "pack-v2":
+            raise AssertionError("benchmark report omitted its selected storage format")
+
         metrics_repo, metrics_source = root / "metrics-repo", root / "metrics-source"
         metrics_source.mkdir()
         (metrics_source / "payload.bin").write_bytes(b"verified object timing" * 65536)

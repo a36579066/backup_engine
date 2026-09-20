@@ -71,15 +71,23 @@ struct BlobWriteTask {
     std::uint8_t codec = 0;
     std::vector<std::uint8_t> stored;
     std::shared_ptr<std::promise<WriteAck>> promise;
+    std::function<void(const WriteAck*, std::exception_ptr)> completion;
+    std::shared_ptr<void> retained_credit;
 };
 
 std::filesystem::path object_path(const std::filesystem::path& repo, const std::string& id);
 ObjectHeader read_object_header(const std::filesystem::path& path);
 std::vector<std::uint8_t> read_object(const std::filesystem::path& path, const std::string& expected_id,
                                       ObjectReadTimings* timings = nullptr);
+ObjectHeader read_packed_object_header(const std::filesystem::path& repo, const ObjectLocation& location);
+std::vector<std::uint8_t> read_packed_object(const std::filesystem::path& repo, const ObjectLocation& location,
+                                             const std::string& expected_id, ObjectReadTimings* timings = nullptr);
 WriteAck write_object(const std::filesystem::path& repo, const std::string& job,
                       BlobWriteTask& task, const std::string& failpoint,
                       ObjectWriteTimings* timings = nullptr);
 
+std::vector<WriteAck> write_pack(const std::filesystem::path& repo, const std::string& job,
+                                 const std::vector<BlobWriteTask*>& tasks, const std::string& failpoint,
+                                 ObjectWriteTimings* timings = nullptr);
 void fsync_directory(const std::filesystem::path& path);
 } // namespace pbe::detail

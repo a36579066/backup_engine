@@ -1,8 +1,8 @@
 # Parallel Backup & Deduplication Engine
 
-Reconstructed architecture milestone 2: Concurrent object-writer pool.
+Reconstructed architecture milestone 3: Memory-bounded batch packs.
 
-A configurable pool of 1 to 32 storage workers durably publishes loose objects. CPU workers release admission before waiting for object ACKs. Only files-v1 is supported.
+Pack-v2 collects a bounded in-memory batch, writes its objects to one immutable pack, and acknowledges the batch after durable publication. Batch size is derived from the memory credit capacity. Files-v1 remains supported.
 
 The engine also includes restore/full verification, source-change checks, bounded memory credits, crash checkpoints, diagnostics, adaptive CPU admission, and benchmark tooling.
 
