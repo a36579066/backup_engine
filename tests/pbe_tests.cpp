@@ -474,9 +474,96 @@ void pack_v2_round_trip() {
     fs::remove_all(root);
 }
 
+void pack_v2_streams_past_memory_budget() {
+    const auto root = fs::temp_directory_path() / ("pbe-pack-streaming-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const auto repo = root / "repo";
+    const auto source = root / "source";
+    fs::create_directories(source);
 
+    constexpr std::size_t chunk_bytes = 1u << 20;
+    constexpr std::size_t chunk_count = 144;
+    std::ofstream out(source / "large-random.bin", std::ios::binary);
+    check(static_cast<bool>(out), "open streaming pack fixture");
+    std::vector<std::uint8_t> chunk(chunk_bytes);
+    std::uint32_t state = 0x7f4a7c15u;
+    for (std::size_t index = 0; index < chunk_count; ++index) {
+        for (auto& byte : chunk) {
+            state = state * 1664525u + 1013904223u;
+            byte = static_cast<std::uint8_t>(state >> 24);
+        }
+        out.write(reinterpret_cast<const char*>(chunk.data()), static_cast<std::streamsize>(chunk.size()));
+    }
+    out.close();
+    check(static_cast<bool>(out), "write streaming pack fixture");
 
+    pbe::init_repository(repo, "pack-v2");
+    pbe::BackupOptions options;
+    options.repo = repo;
+    options.source = source;
+    options.workers = 4;
+    options.writer_workers = 1;
+    options.memory_mib = 8;
+    const auto snapshot = pbe::backup(options);
+    check(snapshot.memory_credit_peak_bytes <= options.memory_mib * 1024u * 1024u,
+          "streaming packs keep chunk buffers within the configured memory budget");
+    check(snapshot.chunks == chunk_count && pbe::verify_snapshot(repo, snapshot.id).bytes == snapshot.logical_bytes,
+          "streaming pack segments retain every object location and verify end to end");
 
+    std::size_t pack_count = 0;
+    for (const auto& item : fs::directory_iterator(repo / "objects" / "packs")) {
+        if (item.path().extension() != ".pack") continue;
+        ++pack_count;
+    }
+    check(pack_count >= 2, "streaming writer rotates a segment after reaching its target size");
+    fs::remove_all(root);
+}
+
+void pack_writer_releases_each_chunk_before_publish() {
+    const auto root = fs::temp_directory_path() / ("pbe-pack-writer-stream-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const auto repo = root / "repo";
+    pbe::init_repository(repo, "pack-v2");
+    constexpr std::size_t chunk_count = 12;
+    std::size_t released_credits = 0;
+    std::vector<pbe::detail::WriteAck> acknowledgements;
+    acknowledgements.reserve(chunk_count);
+    {
+        pbe::detail::PackWriter writer(repo, "streaming-test", "");
+        std::uint32_t state = 0xa341316cu;
+        for (std::size_t index = 0; index < chunk_count; ++index) {
+            pbe::detail::BlobWriteTask task;
+            task.raw_bytes = pbe::detail::kChunkSize;
+            task.codec = 0;
+            task.stored.resize(static_cast<std::size_t>(pbe::detail::kChunkSize));
+            for (auto& byte : task.stored) {
+                state = state * 1664525u + 1013904223u;
+                byte = static_cast<std::uint8_t>(state >> 24);
+            }
+            task.digest = pbe::blake3(task.stored);
+            task.retained_credit = std::shared_ptr<void>(new int(0), [&](void* value) {
+                delete static_cast<int*>(value);
+                ++released_credits;
+            });
+            acknowledgements.push_back(writer.append(task));
+            check(task.stored.empty() && !task.retained_credit,
+                  "pack writer drops the chunk payload and memory credit after staging it");
+            check(released_credits == index + 1,
+                  "each staged chunk releases its memory credit before pack publication");
+        }
+        check(writer.bytes_written() > 8u * 1024u * 1024u,
+              "streaming pack staging grows beyond the test memory budget");
+        writer.publish();
+    }
+
+    check(acknowledgements.size() == chunk_count &&
+          acknowledgements.front().header.pack_id == acknowledgements.back().header.pack_id,
+          "all streamed object acknowledgements point to the published pack");
+    const auto& last = acknowledgements.back().header;
+    const auto restored = pbe::detail::read_packed_object(
+        repo, {last.pack_id, last.pack_offset}, pbe::digest_hex(last.digest));
+    check(restored.size() == pbe::detail::kChunkSize,
+          "streamed pack offsets remain readable after the pack is published");
+    fs::remove_all(root);
+}
 
 void chunk_boundaries() {
     constexpr std::size_t chunk_size = 1u << 20;
@@ -840,6 +927,10 @@ int main() {
         parallel_object_writer_round_trip();
         std::cout << "[TEST] pack_v2_round_trip\n" << std::flush;
         pack_v2_round_trip();
+        std::cout << "[TEST] pack_v2_streams_past_memory_budget\n" << std::flush;
+        pack_v2_streams_past_memory_budget();
+        std::cout << "[TEST] pack_writer_releases_each_chunk_before_publish\n" << std::flush;
+        pack_writer_releases_each_chunk_before_publish();
         std::cout << "[TEST] chunk_boundaries\n" << std::flush;
         chunk_boundaries();
         std::cout << "[TEST] codec_fallback_round_trip\n" << std::flush;

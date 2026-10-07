@@ -86,6 +86,8 @@ using detail::exec;
 using detail::fsync_directory;
 using detail::kChunkSize;
 using detail::kObjectHeaderSize;
+using detail::kPackMaxObjects;
+using detail::kPackTargetBytes;
 using detail::make_trace_line;
 using detail::object_path;
 using detail::read_object;
@@ -102,6 +104,7 @@ using detail::query_snapshot;
 using detail::require_complete;
 using detail::validate_repo;
 
+constexpr auto kPackIdleFlush = std::chrono::milliseconds(2);
 
 std::uint64_t elapsed_ns(Clock::time_point start) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
@@ -569,12 +572,8 @@ BackupSummary backup(const BackupOptions& options) {
     const auto start = Clock::now();
     const std::size_t buffer_budget = options.memory_mib * (std::size_t(1) << 20);
     const std::size_t credit_per_chunk = kChunkSize + ZSTD_compressBound(kChunkSize);
-    const std::size_t credit_capacity = std::max<std::size_t>(1, buffer_budget / credit_per_chunk);
-    const std::size_t credits_per_pack_writer = credit_capacity > 1
-        ? std::max<std::size_t>(1, (credit_capacity - 1) / options.writer_workers) : 1;
-    const std::size_t pack_batch_limit = std::min<std::size_t>(64, credits_per_pack_writer);
     const std::size_t coordinator_batch_size = packed_storage
-        ? std::max<std::size_t>(8, pack_batch_limit * options.writer_workers)
+        ? kPackMaxObjects * options.writer_workers
         : std::max<std::size_t>(8, workers_count * 4);
     MemoryBudget memory(buffer_budget);
     ActiveWorkerGate gate(workers_count, options.adaptive ? 1 : workers_count);
@@ -626,30 +625,40 @@ BackupSummary backup(const BackupOptions& options) {
             blob_writers.start(options.writer_workers, [&](std::size_t) {
                 std::vector<BlobWriteTask> segment;
                 std::vector<WriteAck> acknowledgements;
-                segment.reserve(pack_batch_limit);
-                acknowledgements.reserve(pack_batch_limit);
+                segment.reserve(kPackMaxObjects);
+                acknowledgements.reserve(kPackMaxObjects);
                 try {
                     while (auto first = object_queue.pop()) {
                         segment.clear();
-                        segment.push_back(std::move(*first));
-                        const auto deadline = Clock::now() + std::chrono::milliseconds(2);
-                        while (segment.size() < pack_batch_limit) {
-                            auto next = object_queue.pop_until(deadline);
-                            if (!next) break;
-                            segment.push_back(std::move(*next));
-                        }
-                        const auto write_begin = Clock::now();
+                        acknowledgements.clear();
+                        std::unique_ptr<detail::PackWriter> pack;
+                        std::uint64_t test_delay_ns = 0;
                         detail::ObjectWriteTimings write_timings;
                         bool timings_recorded = false;
-                        try {
+                        const auto append_task = [&](BlobWriteTask&& task) {
+                            segment.push_back(std::move(task));
                             if (errors.cancelled.load(std::memory_order_relaxed))
                                 throw std::runtime_error("backup cancelled");
-                            if (!sleep_cancellable(options.test_writer_delay_ms, errors.cancelled))
+                            if (!pack) {
+                                const auto delay_begin = Clock::now();
+                                if (!sleep_cancellable(options.test_writer_delay_ms, errors.cancelled))
+                                    throw std::runtime_error("backup cancelled");
+                                test_delay_ns += elapsed_ns(delay_begin);
+                                pack = std::make_unique<detail::PackWriter>(repo, job_id, options.failpoint);
+                            }
+                            acknowledgements.push_back(pack->append(segment.back()));
+                        };
+                        try {
+                            append_task(std::move(*first));
+                            while (segment.size() < kPackMaxObjects && pack->bytes_written() < kPackTargetBytes) {
+                                auto next = object_queue.pop_until(std::chrono::steady_clock::now() + kPackIdleFlush);
+                                if (!next) break;
+                                append_task(std::move(*next));
+                            }
+                            if (errors.cancelled.load(std::memory_order_relaxed))
                                 throw std::runtime_error("backup cancelled");
-                            std::vector<BlobWriteTask*> tasks;
-                            tasks.reserve(segment.size());
-                            for (auto& task : segment) tasks.push_back(&task);
-                            acknowledgements = detail::write_pack(repo, job_id, tasks, options.failpoint, &write_timings);
+                            pack->publish();
+                            write_timings = pack->timings();
                             record_object_write(metrics, write_timings);
                             timings_recorded = true;
                             metrics.object_write_operation_count.fetch_add(1, std::memory_order_relaxed);
@@ -658,15 +667,20 @@ BackupSummary backup(const BackupOptions& options) {
                                 if (ack.new_object) metrics.new_stored_bytes.fetch_add(ack.header.stored_bytes + kObjectHeaderSize, std::memory_order_relaxed);
                                 if (ack.new_object) metrics.completed_unique_raw_bytes.fetch_add(ack.header.raw_bytes, std::memory_order_relaxed);
                             }
-                            metrics.writer_busy_ns.fetch_add(elapsed_ns(write_begin), std::memory_order_relaxed);
+                            metrics.writer_busy_ns.fetch_add(write_timings.total_ns + test_delay_ns, std::memory_order_relaxed);
                             for (std::size_t i = 0; i < segment.size(); ++i) {
                                 if (segment[i].completion) segment[i].completion(&acknowledgements[i], {});
                                 else if (segment[i].promise) segment[i].promise->set_value(acknowledgements[i]);
                             }
                         } catch (...) {
                             const auto error = std::current_exception();
-                            if (!timings_recorded) record_object_write(metrics, write_timings);
-                            metrics.writer_busy_ns.fetch_add(elapsed_ns(write_begin), std::memory_order_relaxed);
+                            if (pack) {
+                                write_timings = pack->timings();
+                                if (!timings_recorded) record_object_write(metrics, write_timings);
+                                metrics.writer_busy_ns.fetch_add(write_timings.total_ns + test_delay_ns, std::memory_order_relaxed);
+                            } else {
+                                metrics.writer_busy_ns.fetch_add(test_delay_ns, std::memory_order_relaxed);
+                            }
                             for (auto& task : segment) {
                                 try {
                                     if (task.completion) task.completion(nullptr, error);

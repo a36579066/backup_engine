@@ -18,6 +18,8 @@
 namespace pbe::detail {
 inline constexpr std::uint64_t kChunkSize = 1u << 20;
 inline constexpr std::size_t kObjectHeaderSize = 64;
+inline constexpr std::uint64_t kPackTargetBytes = 128ull << 20;
+inline constexpr std::size_t kPackMaxObjects = 256;
 
 struct ObjectHeader {
     std::uint8_t codec = 0;
@@ -85,9 +87,24 @@ std::vector<std::uint8_t> read_packed_object(const std::filesystem::path& repo, 
 WriteAck write_object(const std::filesystem::path& repo, const std::string& job,
                       BlobWriteTask& task, const std::string& failpoint,
                       ObjectWriteTimings* timings = nullptr);
+class PackWriter {
+public:
+    PackWriter(const std::filesystem::path& repo, const std::string& job, const std::string& failpoint);
+    ~PackWriter();
+    PackWriter(PackWriter&&) noexcept;
+    PackWriter& operator=(PackWriter&&) noexcept;
+    PackWriter(const PackWriter&) = delete;
+    PackWriter& operator=(const PackWriter&) = delete;
 
-std::vector<WriteAck> write_pack(const std::filesystem::path& repo, const std::string& job,
-                                 const std::vector<BlobWriteTask*>& tasks, const std::string& failpoint,
-                                 ObjectWriteTimings* timings = nullptr);
+    WriteAck append(BlobWriteTask& task);
+    std::uint64_t bytes_written() const noexcept;
+    std::size_t object_count() const noexcept;
+    void publish();
+    const ObjectWriteTimings& timings() const noexcept;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 void fsync_directory(const std::filesystem::path& path);
 } // namespace pbe::detail

@@ -1,8 +1,8 @@
 # Parallel Backup & Deduplication Engine
 
-Reconstructed architecture milestone 3: Memory-bounded batch packs.
+Reconstructed architecture milestone 4: Streaming object packs.
 
-Pack-v2 collects a bounded in-memory batch, writes its objects to one immutable pack, and acknowledges the batch after durable publication. Batch size is derived from the memory credit capacity. Files-v1 remains supported.
+Pack-v2 streams objects toward a 128 MiB target or 256-object cap, releasing each payload and memory credit after staging. It publishes after reaching its limit or 2 ms idle. The coordinator still waits at each file boundary.
 
 The engine also includes restore/full verification, source-change checks, bounded memory credits, crash checkpoints, diagnostics, adaptive CPU admission, and benchmark tooling.
 

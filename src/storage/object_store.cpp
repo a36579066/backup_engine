@@ -383,7 +383,7 @@ WriteAck write_object(const std::filesystem::path& repo, const std::string& job,
     }
 }
 
-struct BatchPackWriter {
+struct PackWriter::Impl {
     std::filesystem::path objects_dir;
     std::filesystem::path packs_dir;
     std::filesystem::path temp;
@@ -398,7 +398,7 @@ struct BatchPackWriter {
     std::size_t objects = 0;
     ObjectWriteTimings measured;
 
-    BatchPackWriter(const std::filesystem::path& repo, const std::string& job, const std::string& requested_failpoint)
+    Impl(const std::filesystem::path& repo, const std::string& job, const std::string& requested_failpoint)
         : objects_dir(repo / "objects"), packs_dir(objects_dir / "packs"), failpoint(requested_failpoint) {
         const auto operation_begin = Clock::now();
         const auto setup_begin = Clock::now();
@@ -434,7 +434,7 @@ struct BatchPackWriter {
         }
     }
 
-    ~BatchPackWriter() { cleanup_temp(); }
+    ~Impl() { cleanup_temp(); }
 
     void cleanup_temp() noexcept {
         if (fd >= 0) {
@@ -449,7 +449,7 @@ struct BatchPackWriter {
 
     WriteAck append(BlobWriteTask& task) {
         if (fd < 0 || published_successfully) throw std::runtime_error("cannot append to a closed object pack");
-        if (objects >= 64) throw std::runtime_error("object pack reached its maximum object count");
+        if (objects >= kPackMaxObjects) throw std::runtime_error("object pack reached its maximum object count");
         if (task.codec > 1 || task.raw_bytes > kChunkSize || task.stored.size() > ZSTD_compressBound(kChunkSize))
             throw std::runtime_error("object length or codec exceeds pack format limits");
         const std::uint64_t stored_bytes = static_cast<std::uint64_t>(task.stored.size());
@@ -483,6 +483,8 @@ struct BatchPackWriter {
         measured.staging_write_ns += elapsed_ns(write_begin);
         bytes += kObjectHeaderSize + stored_bytes;
         ++objects;
+        std::vector<std::uint8_t>().swap(task.stored);
+        task.retained_credit.reset();
         measured.total_ns += elapsed_ns(operation_begin);
         return acknowledgement;
     }
@@ -534,27 +536,14 @@ struct BatchPackWriter {
     }
 };
 
-std::vector<WriteAck> write_pack(const std::filesystem::path& repo, const std::string& job,
-                                 const std::vector<BlobWriteTask*>& tasks, const std::string& failpoint,
-                                 ObjectWriteTimings* timings) {
-    if (tasks.empty()) throw std::runtime_error("cannot publish an empty object pack");
-    ObjectWriteTimings discarded;
-    auto* measured = timings ? timings : &discarded;
-    *measured = {};
-    BatchPackWriter writer(repo, job, failpoint);
-    try {
-        std::vector<WriteAck> acknowledgements;
-        acknowledgements.reserve(tasks.size());
-        for (auto* task : tasks) {
-            if (!task) throw std::runtime_error("object pack contains an empty task");
-            acknowledgements.push_back(writer.append(*task));
-        }
-        writer.publish();
-        *measured = writer.measured;
-        return acknowledgements;
-    } catch (...) {
-        *measured = writer.measured;
-        throw;
-    }
-}
+PackWriter::PackWriter(const std::filesystem::path& repo, const std::string& job, const std::string& failpoint)
+    : impl_(std::make_unique<Impl>(repo, job, failpoint)) {}
+PackWriter::~PackWriter() = default;
+PackWriter::PackWriter(PackWriter&&) noexcept = default;
+PackWriter& PackWriter::operator=(PackWriter&&) noexcept = default;
+WriteAck PackWriter::append(BlobWriteTask& task) { return impl_->append(task); }
+std::uint64_t PackWriter::bytes_written() const noexcept { return impl_ ? impl_->bytes : 0; }
+std::size_t PackWriter::object_count() const noexcept { return impl_ ? impl_->objects : 0; }
+void PackWriter::publish() { impl_->publish(); }
+const ObjectWriteTimings& PackWriter::timings() const noexcept { return impl_->measured; }
 } // namespace pbe::detail
