@@ -17,6 +17,11 @@ struct WindowSample {
     std::uint64_t source_scan_ns = 0;
     std::uint64_t source_read_ns = 0;
     std::uint64_t catalog_commit_ns = 0;
+    std::uint64_t metadata_ack_wait_ns = 0;
+    std::uint64_t metadata_queue_wait_ns = 0;
+    std::uint64_t metadata_batches = 0;
+    std::uint64_t duplicate_ack_wait_ns = 0;
+    std::uint64_t staging_write_calls = 0;
     std::uint64_t object_setup_ns = 0;
     std::uint64_t object_staging_write_ns = 0;
     std::uint64_t object_file_sync_ns = 0;
@@ -36,6 +41,7 @@ struct WindowSample {
     std::size_t writer_workers = 1;
     double input_queue_fill = 0;
     double object_queue_fill = 0;
+    double metadata_queue_fill = 0;
     double memory_used_ratio = 0;
     double writer_busy_ratio = 0;
     double cpu_compute_ratio = 0;

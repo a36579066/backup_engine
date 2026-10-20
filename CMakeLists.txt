@@ -17,6 +17,7 @@ add_library(pbe_core
     src/core/engine.cpp
     src/diagnostics/diagnostics.cpp
     src/hashing/blake3.cpp
+    src/pipeline/metadata_stage.cpp
     src/restore/restore_engine.cpp
     src/scheduler/adaptive_controller.cpp
     src/storage/catalog.cpp

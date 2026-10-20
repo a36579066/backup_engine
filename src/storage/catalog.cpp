@@ -33,6 +33,11 @@ void Statement::done() {
     if (sqlite3_step(stmt_) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(db_));
 }
 
+void Statement::reset() {
+    if (sqlite3_reset(stmt_) != SQLITE_OK || sqlite3_clear_bindings(stmt_) != SQLITE_OK)
+        throw std::runtime_error(sqlite3_errmsg(db_));
+}
+
 std::string Statement::string(int index) const {
     const auto* value = sqlite3_column_text(stmt_, index);
     if (!value) return {};

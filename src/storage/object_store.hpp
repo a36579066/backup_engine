@@ -10,6 +10,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -20,6 +21,7 @@ inline constexpr std::uint64_t kChunkSize = 1u << 20;
 inline constexpr std::size_t kObjectHeaderSize = 64;
 inline constexpr std::uint64_t kPackTargetBytes = 128ull << 20;
 inline constexpr std::size_t kPackMaxObjects = 256;
+inline constexpr std::size_t kPackWriteBatchObjects = 8;
 
 struct ObjectHeader {
     std::uint8_t codec = 0;
@@ -46,6 +48,7 @@ struct ObjectReadTimings {
 struct ObjectWriteTimings {
     std::uint64_t setup_ns = 0;
     std::uint64_t staging_write_ns = 0;
+    std::uint64_t staging_write_calls = 0;
     std::uint64_t file_sync_ns = 0;
     std::uint64_t publish_ns = 0;
     std::uint64_t directory_sync_ns = 0;
@@ -97,6 +100,7 @@ public:
     PackWriter& operator=(const PackWriter&) = delete;
 
     WriteAck append(BlobWriteTask& task);
+    std::vector<WriteAck> append_batch(std::span<BlobWriteTask*> tasks);
     std::uint64_t bytes_written() const noexcept;
     std::size_t object_count() const noexcept;
     void publish();

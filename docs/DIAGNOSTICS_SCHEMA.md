@@ -1,0 +1,23 @@
+# Decision trace schema
+
+New JSON Lines records use schema version 6. Each record has `run_id`, `window_id`, elapsed time, scheduler mode, active limit before and after, diagnosis and confidence, queue and stage observations, completed bytes/chunks, throughput, `rule_id`, reason, competing hypotheses, action, and outcome. Version 2 added stage timings and renamed the CPU signal to `cpu_compute_ratio`. Version 3 records `writer_workers` and normalizes `writer_busy_ratio` by the configured object-writer count. Version 4 breaks down source reads, chunk-metadata commits, and the object write path into setup, staging writes, file sync, publish link, directory sync, cleanup, and existing-object checks. Version 5 adds `object_write_operation_count` so pack writes can be compared with the number of contained objects.
+
+`cpu_compute_ratio` estimates the share of admitted worker time spent in BLAKE3 hashing and Zstandard compression/decompression, plus controlled CPU load used by diagnostic scenarios. `controlled_cpu_ms` reports that injected load separately. The ratio excludes object file reads, which are reported as `object_io_ms`. Stage timings are elapsed time around those operations, not hardware performance counters. Timings collected concurrently from multiple workers are summed, so they can exceed a window's wall time. `object_write_count` counts objects written successfully. `object_write_operation_count` counts storage write operations: individual object writes in files-v1 and pack writes in pack-v2. In pack-v2, one operation may contain several objects. `object_write_total_ms` sums the elapsed time of those operations, so it is pack-level elapsed time in pack-v2. Its phase fields are subsets of that total; `object_file_sync_ms` measures staging-file `fsync` (one sync per successful pack), and `object_directory_sync_ms` measures directory sync calls needed to publish data. `source_read_ms` measures source `read()` calls, and `catalog_commit_ms` measures chunk-batch catalog transactions. `object_verify_ms` is end-to-end object read and validation time; it includes object I/O, so it overlaps with `object_io_ms`. The hash and decompression measurements also contribute to object verification time.
+
+In v6, `cpu_output_wait_ratio` measures time blocked while enqueueing an object. CPU workers continue after enqueueing; `writer_ack_wait_ratio` measures asynchronous enqueue-to-durable-result latency and is not CPU thread occupancy. `dedup_claim_wait_ratio` measures duplicate continuation registration, while `duplicate_ack_wait_ms` reports the subsequent asynchronous latency. Older traces retain their original interpretation and remain readable by `pbe explain`.
+
+Version 6 also adds `metadata_queue_fill_ratio`, reader backpressure in `metadata_queue_wait_ms`, and the catalog consumer's durable-result wait in `metadata_ack_wait_ms`. The consumer waits before opening a transaction. `metadata_batches` counts committed batches spanning one or more files. `staging_write_calls` counts actual staging `write()`/`writev()` calls, including pack headers. Pack writers gather up to eight already-available objects without allocating another payload buffer. Run summaries preserve these counters and the metadata queue/batch bounds.
+
+In v6, `catalog_commit_ms` covers the new transactions containing both entries and chunk references. Earlier implementations timed chunk-reference transactions and did not include the separate entry transactions in this field, so their catalog totals are not directly comparable. Concurrent stage elapsed times can rise as stages overlap; assess them alongside process CPU time, queue pressure, and total backup wall time.
+
+Run the four reproducible injected scenarios and preserve their decision traces with:
+
+```sh
+python3 tools/run_diagnostic_scenarios.py --pbe build-release/pbe --output reports/diagnostics
+```
+
+The report includes CPU-heavy, writer-throttled, memory-limited, and input-limited cases. It records observed diagnoses without treating injected test pressure as proof of a hardware bottleneck; each resulting snapshot is fully verified.
+
+Classifications are evidence-based stage hypotheses: `CPU_LIMITED`, `WRITER_LIMITED`, `MEMORY_LIMITED`, `DEDUP_CONTENTION`, `INPUT_LIMITED`, `MIXED`, or `UNKNOWN`. The writer label describes the PBE writer stage; it does not claim that the physical disk is saturated. Missing work or brief runs produce insufficient-data records and no adjustment.
+
+Trace writes are optional. A report failure must not affect snapshot publication. `pbe explain --repo PATH --run RUN_ID` summarizes the recorded diagnoses and actions and suggests reproducible follow-up experiments.

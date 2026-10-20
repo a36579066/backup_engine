@@ -29,12 +29,12 @@ std::string json_escape(std::string_view value) {
 Diagnosis classify(const WindowSample& m) {
     if (m.completed_chunks < 4 || m.elapsed_ns < 300000000ull) return {};
     if (m.memory_used_ratio >= 0.80 && m.memory_wait_ratio >= 0.15)
-        return {"MEMORY_LIMITED", "medium", "MEMORY_CREDITS_R1", "Credits were near the configured budget and workers spent time waiting for credits.", "A small budget and bursty file input can produce similar waits."};
+        return {"MEMORY_LIMITED", "medium", "MEMORY_CREDITS_R1", "Credits were near the configured budget and the reader waited for buffer credits.", "A small budget or downstream backpressure can produce similar waits."};
     if (m.writer_busy_ratio >= 0.85 && m.output_wait_ratio >= 0.20 &&
         (m.object_queue_fill >= 0.75 || m.writer_ack_wait_ratio >= 0.20))
-        return {"WRITER_LIMITED", "medium", "WRITE_BACKPRESSURE_R1", "The writer stayed busy while workers waited for object acknowledgement or output queue space.", "This points to the writer stage; it does not prove a physical disk bandwidth limit."};
+        return {"WRITER_LIMITED", "medium", "WRITE_BACKPRESSURE_R2", "The writer stayed busy while CPU workers were blocked on output queue space.", "This points to the writer stage; it does not prove a physical disk bandwidth limit."};
     if (m.claim_wait_ratio >= 0.15)
-        return {"DEDUP_CONTENTION", "medium", "CLAIM_WAIT_R1", "Workers spent a measurable part of the window waiting for in-flight duplicate chunks.", "Repeated content and scheduling interleaving both affect claim wait."};
+        return {"DEDUP_CONTENTION", "medium", "CLAIM_REGISTRATION_R2", "Workers spent a measurable part of the window registering duplicate continuations.", "Registry locking and scheduling interleaving can affect registration time; duplicate ACK latency is asynchronous."};
     if (m.cpu_compute_ratio >= 0.65 && m.input_queue_fill >= 0.35 && m.writer_busy_ratio < 0.85 && m.object_queue_fill < 0.75)
         return {"CPU_LIMITED", "medium", "CPU_BACKLOG_R1", "The input queue held work while compute stages were active and the writer queue had headroom.", "Compression level and data compressibility may change CPU demand."};
     if (m.input_queue_fill < 0.10 && m.cpu_compute_ratio < 0.50)
@@ -48,7 +48,7 @@ std::string make_trace_line(std::string_view run_id, std::uint64_t window_id,
                             std::string_view action, std::string_view outcome) {
     std::ostringstream out;
     out << std::fixed << std::setprecision(4)
-        << "{\"schema_version\":5,\"run_id\":\"" << json_escape(run_id)
+        << "{\"schema_version\":6,\"run_id\":\"" << json_escape(run_id)
         << "\",\"window_id\":" << window_id
         << ",\"elapsed_ms\":" << (m.elapsed_ns / 1000000.0)
         << ",\"scheduler_mode\":\"" << json_escape(scheduler)
@@ -58,6 +58,7 @@ std::string make_trace_line(std::string_view run_id, std::uint64_t window_id,
         << "\",\"confidence\":\"" << json_escape(d.confidence)
         << "\",\"observations\":{\"input_queue_fill_ratio\":" << m.input_queue_fill
         << ",\"object_queue_fill_ratio\":" << m.object_queue_fill
+        << ",\"metadata_queue_fill_ratio\":" << m.metadata_queue_fill
         << ",\"writer_busy_ratio\":" << m.writer_busy_ratio
         << ",\"writer_workers\":" << m.writer_workers
         << ",\"cpu_compute_ratio\":" << m.cpu_compute_ratio
@@ -70,6 +71,11 @@ std::string make_trace_line(std::string_view run_id, std::uint64_t window_id,
         << ",\"source_scan_ms\":" << (m.source_scan_ns / 1000000.0)
         << ",\"source_read_ms\":" << (m.source_read_ns / 1000000.0)
         << ",\"catalog_commit_ms\":" << (m.catalog_commit_ns / 1000000.0)
+        << ",\"metadata_ack_wait_ms\":" << (m.metadata_ack_wait_ns / 1000000.0)
+        << ",\"metadata_queue_wait_ms\":" << (m.metadata_queue_wait_ns / 1000000.0)
+        << ",\"metadata_batches\":" << m.metadata_batches
+        << ",\"duplicate_ack_wait_ms\":" << (m.duplicate_ack_wait_ns / 1000000.0)
+        << ",\"staging_write_calls\":" << m.staging_write_calls
         << ",\"object_setup_ms\":" << (m.object_setup_ns / 1000000.0)
         << ",\"object_staging_write_ms\":" << (m.object_staging_write_ns / 1000000.0)
         << ",\"object_file_sync_ms\":" << (m.object_file_sync_ns / 1000000.0)

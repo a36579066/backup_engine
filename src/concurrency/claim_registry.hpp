@@ -5,12 +5,14 @@
 #include <condition_variable>
 #include <cstddef>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace pbe::detail {
 template<class Value>
@@ -20,6 +22,7 @@ struct ClaimState {
     bool ready = false;
     Value value{};
     std::exception_ptr error;
+    std::vector<std::function<void(const Value*, std::exception_ptr)>> continuations;
 };
 
 template<class Value>
@@ -37,13 +40,44 @@ public:
     }
     void complete(const std::string& id, const std::shared_ptr<State>& state, const Value& value) {
         (void)id;
-        { std::lock_guard lock(state->mutex); state->value = value; state->ready = true; }
+        std::vector<std::function<void(const Value*, std::exception_ptr)>> continuations;
+        {
+            std::lock_guard lock(state->mutex);
+            if (state->ready) return;
+            state->value = value; state->ready = true;
+            continuations.swap(state->continuations);
+        }
         state->cv.notify_all();
+        for (auto& continuation : continuations) {
+            try { continuation(&state->value, {}); } catch (...) {}
+        }
     }
     void fail(const std::string& id, const std::shared_ptr<State>& state, std::exception_ptr error) {
-        { std::lock_guard lock(state->mutex); state->error = error; state->ready = true; }
+        std::vector<std::function<void(const Value*, std::exception_ptr)>> continuations;
+        {
+            std::lock_guard lock(state->mutex);
+            if (state->ready) return;
+            state->error = error; state->ready = true;
+            continuations.swap(state->continuations);
+        }
         state->cv.notify_all();
+        for (auto& continuation : continuations) {
+            try { continuation(nullptr, error); } catch (...) {}
+        }
         erase_if_current(id, state);
+    }
+    void when_ready(const std::shared_ptr<State>& state,
+                    std::function<void(const Value*, std::exception_ptr)> continuation) {
+        std::exception_ptr error;
+        {
+            std::lock_guard lock(state->mutex);
+            if (!state->ready) {
+                state->continuations.push_back(std::move(continuation));
+                return;
+            }
+            error = state->error;
+        }
+        continuation(error ? nullptr : &state->value, error);
     }
     // Keep a completed claim discoverable until the coordinator commits its
     // object row. Otherwise a later duplicate can miss SQLite and publish the

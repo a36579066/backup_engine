@@ -54,6 +54,7 @@ struct BackupSummary : SnapshotSummary {
     std::size_t workers = 0;
     std::size_t writer_workers = 1;
     std::string scheduler;
+    std::size_t metadata_batches = 0;
     std::string run_id;
     std::size_t memory_credit_peak_bytes = 0;
     std::size_t process_rss_peak_bytes = 0;

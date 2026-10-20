@@ -5,11 +5,14 @@
 #include "concurrency/worker_pool.hpp"
 #include "scheduler/active_worker_gate.hpp"
 #include "diagnostics/diagnostics.hpp"
+#include "pipeline/metadata_stage.hpp"
+#include "storage/catalog.hpp"
 #include "storage/object_store.hpp"
 #include "pbe/blake3.hpp"
 #include "pbe/bounded_queue.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -163,7 +166,14 @@ void concurrency_contract() {
     auto [owner_state, owner] = claims.claim("digest");
     auto [waiter_state, duplicate_owner] = claims.claim("digest");
     check(owner && !duplicate_owner && owner_state == waiter_state, "duplicate digest shares an in-flight claim");
+    std::size_t delivered = 0;
+    bool correct_delivery = false;
+    claims.when_ready(waiter_state, [&](const std::string* value, std::exception_ptr error) {
+        ++delivered; correct_delivery = !error && value && *value == "object-header";
+    });
+    check(delivered == 0, "duplicate continuation registration returns before the owner completes");
     claims.complete("digest", owner_state, "object-header");
+    check(delivered == 1 && correct_delivery, "owner completion delivers the duplicate continuation exactly once");
     check(claims.size() == 1, "completed claim stays visible until metadata commit");
     check(claims.wait(waiter_state, cancelled) == "object-header", "existing waiters retain the completed state");
 
@@ -176,10 +186,31 @@ void concurrency_contract() {
     check(next_owner && next_state != owner_state && claims.size() == 1,
           "claim after committed metadata creates a new in-flight state");
     claims.fail("digest", next_state, std::make_exception_ptr(std::runtime_error("injected claim failure")));
+    bool failure_callback = false;
+    claims.when_ready(next_state, [&](const std::string* value, std::exception_ptr error) {
+        failure_callback = !value && static_cast<bool>(error);
+    });
     bool failed_as_expected = false;
     try { (void)claims.wait(next_state, cancelled); }
     catch (const std::runtime_error&) { failed_as_expected = true; }
-    check(failed_as_expected && claims.size() == 0, "failed claim wakes waiters and is removed");
+    check(failed_as_expected && failure_callback && claims.size() == 0, "failed claim wakes waiters and continuations and is removed");
+
+    auto [race_state, race_owner] = claims.claim("race");
+    check(race_owner, "create concurrent continuation test owner");
+    std::atomic<std::size_t> callbacks{0};
+    std::vector<std::thread> subscribers;
+    for (int i = 0; i < 8; ++i) {
+        subscribers.emplace_back([&] {
+            for (int j = 0; j < 50; ++j)
+                claims.when_ready(race_state, [&](const std::string* value, std::exception_ptr error) {
+                    if (!error && value && *value == "ready") callbacks.fetch_add(1);
+                });
+        });
+    }
+    claims.complete("race", race_state, "ready");
+    for (auto& thread : subscribers) thread.join();
+    check(callbacks.load() == 400, "concurrent subscriptions racing completion neither lose nor duplicate delivery");
+    claims.release("race");
 }
 
 void diagnosis_rules() {
@@ -287,6 +318,116 @@ void object_store_contract() {
     fs::remove_all(repo);
 }
 
+void metadata_stage_contract() {
+    const auto root = fs::temp_directory_path() / ("pbe-metadata-stage-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const auto repo = root / "repo";
+    pbe::init_repository(repo);
+    pbe::detail::Catalog catalog(repo / "catalog.sqlite", true);
+    // Older files-v1 catalogs predate the optional pack locator columns.
+    pbe::detail::exec(catalog.get(), "PRAGMA foreign_keys=OFF; DROP TABLE objects; CREATE TABLE objects(object_id TEXT PRIMARY KEY,raw_bytes INTEGER NOT NULL,stored_bytes INTEGER NOT NULL,codec TEXT NOT NULL); PRAGMA foreign_keys=ON;");
+    pbe::detail::exec(catalog.get(), "INSERT INTO snapshots(id,created_ns,source_root,status,chunk_bytes) VALUES('stage-test',0,'source','IN_PROGRESS',1048576)");
+    std::atomic<bool> cancelled{false};
+    const auto count = [&](const char* sql) {
+        pbe::detail::Statement query(catalog.get(), sql);
+        check(query.row(), "metadata stage count query returns a row");
+        return query.i64(0);
+    };
+    const auto entry = [](const std::string& path) { return pbe::detail::DbEntry{path, "file", "", 8, 0644, 0}; };
+
+    pbe::detail::MetadataBatch failed;
+    failed.entries.push_back(entry("failed.bin"));
+    std::promise<pbe::detail::ObjectHeader> error;
+    auto failed_result = error.get_future();
+    error.set_exception(std::make_exception_ptr(std::runtime_error("object writer failed")));
+    failed.chunks.push_back({"failed.bin", 0, 8, std::move(failed_result)});
+    bool rejected = false;
+    try { pbe::detail::commit_metadata_batch(catalog.get(), "stage-test", failed, {}, cancelled); }
+    catch (...) { rejected = true; }
+    check(rejected && count("SELECT COUNT(*) FROM entries") == 0 && count("SELECT COUNT(*) FROM objects") == 0,
+          "failed object acknowledgement publishes no entry or chunk metadata");
+
+    pbe::detail::BlobWriteTask task;
+    task.stored.assign(8, 'x'); task.raw_bytes = 8; task.digest = pbe::blake3(task.stored);
+    const auto ack = pbe::detail::write_object(repo, "metadata-test", task, {});
+    pbe::detail::MetadataBatch batch;
+    for (const std::string path : {"first.bin", "duplicate.bin"}) {
+        batch.entries.push_back(entry(path));
+        std::promise<pbe::detail::ObjectHeader> ready;
+        auto result = ready.get_future();
+        auto header = ack.header;
+        header.newly_written = path == "first.bin";
+        ready.set_value(header);
+        batch.chunks.push_back({path, 0, 8, std::move(result)});
+    }
+    const auto committed = pbe::detail::commit_metadata_batch(catalog.get(), "stage-test", batch, {}, cancelled);
+    check(committed.unique_raw_bytes == 8 && committed.reused_chunks == 1 &&
+          count("SELECT COUNT(*) FROM entries") == 2 && count("SELECT COUNT(*) FROM entry_chunks") == 2 &&
+          count("SELECT COUNT(*) FROM objects") == 1,
+          "one metadata transaction commits chunks for multiple files with exact deduplication counters");
+
+    pbe::detail::MetadataBatch rollback;
+    rollback.entries.push_back(entry("rollback.bin"));
+    for (int i = 0; i < 2; ++i) {
+        std::promise<pbe::detail::ObjectHeader> ready;
+        auto result = ready.get_future(); ready.set_value(ack.header);
+        rollback.chunks.push_back({"rollback.bin", 0, 8, std::move(result)});
+    }
+    rejected = false;
+    try { pbe::detail::commit_metadata_batch(catalog.get(), "stage-test", rollback, {}, cancelled); }
+    catch (...) { rejected = true; }
+    check(rejected && count("SELECT COUNT(*) FROM entries") == 2 && count("SELECT COUNT(*) FROM entry_chunks") == 2,
+          "a constraint failure rolls back the entire metadata batch");
+
+    pbe::detail::MetadataBatch waiting;
+    std::promise<pbe::detail::ObjectHeader> unavailable;
+    waiting.chunks.push_back({"cancelled.bin", 0, 8, unavailable.get_future()});
+    cancelled.store(true);
+    rejected = false;
+    try { pbe::detail::commit_metadata_batch(catalog.get(), "stage-test", waiting, {}, cancelled); }
+    catch (...) { rejected = true; }
+    check(rejected, "metadata cancellation interrupts waiting for a durable acknowledgement");
+    fs::remove_all(root);
+}
+
+void pipeline_across_file_boundaries() {
+    for (const std::string format : {"files-v1", "pack-v2"}) {
+        for (const std::size_t workers : {1u, 8u}) {
+            const auto root = fs::temp_directory_path() / ("pbe-cross-file-pipeline-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+            const auto repo = root / "repo", source = root / "source";
+            fs::create_directories(source);
+            std::uint64_t expected_unique = 0;
+            for (std::size_t i = 0; i < 300; ++i) {
+                const std::string text = "deduplicated-across-file-boundaries-" + std::to_string(i % 100);
+                write_bytes(source / ("file-" + std::to_string(i) + ".txt"), {text.begin(), text.end()});
+                if (i < 100) expected_unique += text.size();
+            }
+            pbe::init_repository(repo, format);
+            pbe::BackupOptions options;
+            options.repo = repo; options.source = source; options.workers = workers;
+            options.writer_workers = 2; options.memory_mib = 3;
+            const auto snapshot = pbe::backup(options);
+            check(snapshot.files == 300 && snapshot.chunks == 300 && snapshot.reused_chunks == 200 &&
+                  snapshot.unique_raw_bytes == expected_unique && pbe::repository_stats(repo).object_count == 100,
+                  "cross-file pipeline preserves exact deduplication with one or eight CPU workers");
+            check(snapshot.metadata_batches < 150 && snapshot.memory_credit_peak_bytes <= 3u * 1024u * 1024u,
+                  "cross-file metadata is batched and chunk credits remain bounded with a one-chunk budget");
+            check(pbe::verify_snapshot(repo, snapshot.id).bytes == snapshot.logical_bytes,
+                  "every asynchronously published file passes full verification");
+            if (workers == 8) {
+                options.trust_metadata = true;
+                const auto cached = pbe::backup(options);
+                check(cached.read_bytes == 0 && cached.unique_raw_bytes == 0 && cached.reused_chunks == 300 &&
+                      pbe::verify_snapshot(repo, cached.id).bytes == cached.logical_bytes,
+                      "trusted metadata queries coexist with the dedicated metadata writer across batches");
+                const auto restored = root / "restored";
+                pbe::restore_snapshot({repo, restored, snapshot.id});
+                check(same_tree(source, restored), "cross-file pipeline restores the complete source tree");
+            }
+            fs::remove_all(root);
+        }
+    }
+}
+
 void backup_round_trip() {
     const auto root = fs::temp_directory_path() / ("pbe-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     const auto repo = root / "repo";
@@ -343,7 +484,7 @@ void backup_round_trip() {
     check(fs::last_write_time(restored / "folder") == folder_time, "restore preserves directory mtime");
     const auto trace_path = repo / "reports" / (first.run_id + ".jsonl");
     const auto trace = read_text(trace_path);
-    check(trace.find("\"schema_version\":5") != std::string::npos &&
+    check(trace.find("\"schema_version\":6") != std::string::npos &&
           trace.find("\"active_limit_before\"") != std::string::npos &&
           trace.find("\"writer_workers\":1") != std::string::npos &&
           trace.find("\"hash_ms\"") != std::string::npos &&
@@ -529,24 +670,36 @@ void pack_writer_releases_each_chunk_before_publish() {
     {
         pbe::detail::PackWriter writer(repo, "streaming-test", "");
         std::uint32_t state = 0xa341316cu;
-        for (std::size_t index = 0; index < chunk_count; ++index) {
-            pbe::detail::BlobWriteTask task;
-            task.raw_bytes = pbe::detail::kChunkSize;
-            task.codec = 0;
-            task.stored.resize(static_cast<std::size_t>(pbe::detail::kChunkSize));
-            for (auto& byte : task.stored) {
-                state = state * 1664525u + 1013904223u;
-                byte = static_cast<std::uint8_t>(state >> 24);
+        for (std::size_t index = 0; index < chunk_count;) {
+            const auto count = index < 4 ? std::size_t(1) : std::min<std::size_t>(4, chunk_count - index);
+            std::array<pbe::detail::BlobWriteTask, 4> tasks;
+            std::array<pbe::detail::BlobWriteTask*, 4> pointers{};
+            for (std::size_t i = 0; i < count; ++i) {
+                auto& task = tasks[i];
+                pointers[i] = &task;
+                task.raw_bytes = pbe::detail::kChunkSize;
+                task.codec = 0;
+                task.stored.resize(static_cast<std::size_t>(pbe::detail::kChunkSize));
+                for (auto& byte : task.stored) {
+                    state = state * 1664525u + 1013904223u;
+                    byte = static_cast<std::uint8_t>(state >> 24);
+                }
+                task.digest = pbe::blake3(task.stored);
+                task.retained_credit = std::shared_ptr<void>(new int(0), [&](void* value) {
+                    delete static_cast<int*>(value);
+                    ++released_credits;
+                });
             }
-            task.digest = pbe::blake3(task.stored);
-            task.retained_credit = std::shared_ptr<void>(new int(0), [&](void* value) {
-                delete static_cast<int*>(value);
-                ++released_credits;
-            });
-            acknowledgements.push_back(writer.append(task));
-            check(task.stored.empty() && !task.retained_credit,
-                  "pack writer drops the chunk payload and memory credit after staging it");
-            check(released_credits == index + 1,
+            if (count == 1) acknowledgements.push_back(writer.append(tasks[0]));
+            else {
+                auto batch = writer.append_batch(std::span<pbe::detail::BlobWriteTask*>(pointers.data(), count));
+                for (auto& ack : batch) acknowledgements.push_back(std::move(ack));
+            }
+            for (std::size_t i = 0; i < count; ++i)
+                check(tasks[i].stored.empty() && !tasks[i].retained_credit,
+                      "single and gathered pack writes release staged payloads and credits");
+            index += count;
+            check(released_credits == index,
                   "each staged chunk releases its memory credit before pack publication");
         }
         check(writer.bytes_written() > 8u * 1024u * 1024u,
@@ -557,11 +710,13 @@ void pack_writer_releases_each_chunk_before_publish() {
     check(acknowledgements.size() == chunk_count &&
           acknowledgements.front().header.pack_id == acknowledgements.back().header.pack_id,
           "all streamed object acknowledgements point to the published pack");
-    const auto& last = acknowledgements.back().header;
-    const auto restored = pbe::detail::read_packed_object(
-        repo, {last.pack_id, last.pack_offset}, pbe::digest_hex(last.digest));
-    check(restored.size() == pbe::detail::kChunkSize,
-          "streamed pack offsets remain readable after the pack is published");
+    for (const auto& ack : acknowledgements) {
+        const auto& header = ack.header;
+        const auto restored = pbe::detail::read_packed_object(
+            repo, {header.pack_id, header.pack_offset}, pbe::digest_hex(header.digest));
+        check(restored.size() == pbe::detail::kChunkSize,
+              "every single and gathered write offset verifies after pack publication");
+    }
     fs::remove_all(root);
 }
 
@@ -919,6 +1074,10 @@ int main() {
         adaptive_controller_policy();
         std::cout << "[TEST] object_store_contract\n" << std::flush;
         object_store_contract();
+        std::cout << "[TEST] metadata_stage_contract\n" << std::flush;
+        metadata_stage_contract();
+        std::cout << "[TEST] pipeline_across_file_boundaries\n" << std::flush;
+        pipeline_across_file_boundaries();
         std::cout << "[TEST] initialization_refuses_existing_data\n" << std::flush;
         initialization_refuses_existing_data();
         std::cout << "[TEST] backup_round_trip\n" << std::flush;

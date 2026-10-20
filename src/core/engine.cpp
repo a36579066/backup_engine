@@ -6,6 +6,7 @@
 #include "concurrency/worker_pool.hpp"
 #include "scheduler/active_worker_gate.hpp"
 #include "diagnostics/diagnostics.hpp"
+#include "pipeline/metadata_stage.hpp"
 #include "storage/object_store.hpp"
 #include "storage/repository.hpp"
 #include "storage/snapshot_catalog.hpp"
@@ -66,6 +67,8 @@ using detail::ActiveWorkerGate;
 using detail::Catalog;
 using detail::ClaimRegistry;
 using detail::MemoryBudget;
+using detail::MetadataBatch;
+using detail::PendingChunk;
 using detail::FixedWorkerPool;
 using detail::BlobWriteTask;
 using detail::ChunkRef;
@@ -88,6 +91,7 @@ using detail::kChunkSize;
 using detail::kObjectHeaderSize;
 using detail::kPackMaxObjects;
 using detail::kPackTargetBytes;
+using detail::kPackWriteBatchObjects;
 using detail::make_trace_line;
 using detail::object_path;
 using detail::read_object;
@@ -105,6 +109,14 @@ using detail::require_complete;
 using detail::validate_repo;
 
 constexpr auto kPackIdleFlush = std::chrono::milliseconds(2);
+
+void complete_blob_task(BlobWriteTask& task, const WriteAck* ack, std::exception_ptr error) {
+    if (task.completion) task.completion(ack, error);
+    else if (task.promise) {
+        if (error) task.promise->set_exception(error);
+        else if (ack) task.promise->set_value(*ack);
+    }
+}
 
 std::uint64_t elapsed_ns(Clock::time_point start) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
@@ -206,8 +218,12 @@ struct PipelineMetrics {
     std::atomic<std::uint64_t> source_scan_ns{0};
     std::atomic<std::uint64_t> source_read_ns{0};
     std::atomic<std::uint64_t> catalog_commit_ns{0};
+    std::atomic<std::uint64_t> metadata_ack_wait_ns{0};
+    std::atomic<std::uint64_t> metadata_queue_wait_ns{0};
+    std::atomic<std::uint64_t> metadata_batches{0};
     std::atomic<std::uint64_t> object_setup_ns{0};
     std::atomic<std::uint64_t> object_staging_write_ns{0};
+    std::atomic<std::uint64_t> staging_write_calls{0};
     std::atomic<std::uint64_t> object_file_sync_ns{0};
     std::atomic<std::uint64_t> object_publish_ns{0};
     std::atomic<std::uint64_t> object_directory_sync_ns{0};
@@ -220,6 +236,7 @@ struct PipelineMetrics {
     std::atomic<std::uint64_t> writer_ack_wait_ns{0};
     std::atomic<std::uint64_t> writer_busy_ns{0};
     std::atomic<std::uint64_t> claim_wait_ns{0};
+    std::atomic<std::uint64_t> duplicate_ack_wait_ns{0};
     std::atomic<std::uint64_t> completed_chunks{0};
     std::atomic<std::uint64_t> completed_raw_bytes{0};
     std::atomic<std::uint64_t> completed_unique_raw_bytes{0};
@@ -241,6 +258,7 @@ void record_object_read(PipelineMetrics& metrics, const ObjectReadTimings& timin
 void record_object_write(PipelineMetrics& metrics, const detail::ObjectWriteTimings& timings) {
     metrics.object_setup_ns.fetch_add(timings.setup_ns, std::memory_order_relaxed);
     metrics.object_staging_write_ns.fetch_add(timings.staging_write_ns, std::memory_order_relaxed);
+    metrics.staging_write_calls.fetch_add(timings.staging_write_calls, std::memory_order_relaxed);
     metrics.object_file_sync_ns.fetch_add(timings.file_sync_ns, std::memory_order_relaxed);
     metrics.object_publish_ns.fetch_add(timings.publish_ns, std::memory_order_relaxed);
     metrics.object_directory_sync_ns.fetch_add(timings.directory_sync_ns, std::memory_order_relaxed);
@@ -355,34 +373,6 @@ void set_snapshot_status(sqlite3* db, const std::string& id, const std::string& 
     statement.done();
 }
 
-void insert_entry(sqlite3* db, const std::string& snapshot, const SourceEntry& entry) {
-    Statement statement(db, "INSERT INTO entries(snapshot_id,relative_path,kind,size_bytes,mode_bits,mtime_ns,symlink_target) VALUES(?,?,?,?,?,?,?)");
-    statement.text(1, snapshot); statement.text(2, entry.relative); statement.text(3, entry.kind);
-    statement.integer(4, static_cast<std::int64_t>(entry.size)); statement.integer(5, entry.mode); statement.integer(6, entry.mtime_ns);
-    if (entry.kind == "symlink") statement.text(7, entry.symlink_target); else statement.null(7);
-    statement.done();
-}
-
-void insert_object(sqlite3* db, const std::string& id, const ObjectHeader& header) {
-    if (header.pack_id.empty()) {
-        Statement statement(db, "INSERT INTO objects(object_id,raw_bytes,stored_bytes,codec) VALUES(?,?,?,?) ON CONFLICT(object_id) DO UPDATE SET raw_bytes=excluded.raw_bytes,stored_bytes=excluded.stored_bytes,codec=excluded.codec");
-        statement.text(1, id); statement.integer(2, static_cast<std::int64_t>(header.raw_bytes));
-        statement.integer(3, static_cast<std::int64_t>(header.stored_bytes)); statement.text(4, header.codec ? "zstd" : "raw"); statement.done();
-    } else {
-        Statement statement(db, "INSERT INTO objects(object_id,raw_bytes,stored_bytes,codec,pack_id,pack_offset) VALUES(?,?,?,?,?,?) ON CONFLICT(object_id) DO UPDATE SET raw_bytes=excluded.raw_bytes,stored_bytes=excluded.stored_bytes,codec=excluded.codec,pack_id=excluded.pack_id,pack_offset=excluded.pack_offset");
-        statement.text(1, id); statement.integer(2, static_cast<std::int64_t>(header.raw_bytes));
-        statement.integer(3, static_cast<std::int64_t>(header.stored_bytes)); statement.text(4, header.codec ? "zstd" : "raw");
-        statement.text(5, header.pack_id); statement.integer(6, static_cast<std::int64_t>(header.pack_offset)); statement.done();
-    }
-}
-
-void insert_chunk(sqlite3* db, const std::string& snapshot, const std::string& path,
-                  std::uint64_t ordinal, const std::string& id, std::uint64_t bytes) {
-    Statement statement(db, "INSERT INTO entry_chunks(snapshot_id,relative_path,ordinal,object_id,chunk_bytes) VALUES(?,?,?,?,?)");
-    statement.text(1, snapshot); statement.text(2, path); statement.integer(3, static_cast<std::int64_t>(ordinal));
-    statement.text(4, id); statement.integer(5, static_cast<std::int64_t>(bytes)); statement.done();
-}
-
 void recover_incomplete(sqlite3* db, const std::filesystem::path& repo) {
     Transaction transaction(db);
     exec(db, "UPDATE snapshots SET status='FAILED' WHERE status='IN_PROGRESS'");
@@ -416,19 +406,6 @@ void recover_incomplete(sqlite3* db, const std::filesystem::path& repo) {
         }
         if (removed_orphan) fsync_directory(pack_dir);
     }
-}
-
-void insert_chunk_batch(sqlite3* db, const std::string& snapshot, const std::string& path,
-                        const std::vector<ChunkRef>& chunks, const std::vector<ObjectHeader>& headers,
-                        const std::string& failpoint) {
-    if (chunks.size() != headers.size()) throw std::runtime_error("chunk metadata batch is inconsistent");
-    Transaction transaction(db);
-    for (std::size_t i = 0; i < chunks.size(); ++i) {
-        insert_object(db, chunks[i].object_id, headers[i]);
-        insert_chunk(db, snapshot, path, chunks[i].ordinal, chunks[i].object_id, chunks[i].bytes);
-    }
-    maybe_failpoint(failpoint, "before-sqlite-batch-commit");
-    transaction.commit();
 }
 
 std::size_t current_rss_bytes() {
@@ -470,14 +447,6 @@ std::unordered_map<std::string, CachedEntry> load_metadata_cache(sqlite3* db, co
         static_cast<std::uint64_t>(entries.i64(2)), static_cast<std::uint32_t>(entries.i64(3)),
         entries.i64(4), entries.string(1), entries.string(5)});
     return cache;
-}
-
-void snapshot_entry_transaction(sqlite3* db, const std::string& snapshot,
-                                const SourceEntry& entry, const std::string& failpoint) {
-    Transaction transaction(db);
-    insert_entry(db, snapshot, entry);
-    maybe_failpoint(failpoint, "before-sqlite-batch-commit");
-    transaction.commit();
 }
 
 } // namespace
@@ -583,6 +552,7 @@ BackupSummary backup(const BackupOptions& options) {
         : input_queue_capacity;
     BoundedQueue<ChunkTask> input_queue(input_queue_capacity);
     BoundedQueue<BlobWriteTask> object_queue(object_queue_capacity);
+    BoundedQueue<MetadataBatch> metadata_queue(4);
     ClaimRegistry<ObjectHeader> claims;
     VerifiedObjectCache verified_existing_objects(4096);
     WorkerError errors;
@@ -592,15 +562,18 @@ BackupSummary backup(const BackupOptions& options) {
     FixedWorkerPool blob_writers;
     std::vector<std::unique_ptr<Catalog>> object_index_readers;
     std::thread monitor;
+    std::thread metadata_writer;
     std::atomic<bool> monitor_stop{false};
     bool monitor_started = false;
     auto fail = [&](std::exception_ptr error) {
         errors.set(error);
         input_queue.close();
         object_queue.close();
+        metadata_queue.close();
         gate.close();
     };
     auto finish_threads = [&](bool failed) {
+        metadata_queue.close();
         if (failed) {
             input_queue.close(); object_queue.close(); gate.close();
         } else {
@@ -609,6 +582,7 @@ BackupSummary backup(const BackupOptions& options) {
         cpu_workers.join();
         object_queue.close();
         blob_writers.join();
+        if (metadata_writer.joinable()) metadata_writer.join();
         if (monitor_started) { monitor_stop.store(true, std::memory_order_relaxed); if (monitor.joinable()) monitor.join(); monitor_started = false; }
     };
 
@@ -646,11 +620,22 @@ BackupSummary backup(const BackupOptions& options) {
                                 test_delay_ns += elapsed_ns(delay_begin);
                                 pack = std::make_unique<detail::PackWriter>(repo, job_id, options.failpoint);
                             }
-                            acknowledgements.push_back(pack->append(segment.back()));
                         };
                         try {
                             append_task(std::move(*first));
-                            while (segment.size() < kPackMaxObjects && pack->bytes_written() < kPackTargetBytes) {
+                            for (;;) {
+                                const auto batch_begin = acknowledgements.size();
+                                while (segment.size() - batch_begin < kPackWriteBatchObjects && segment.size() < kPackMaxObjects) {
+                                    auto ready = object_queue.pop_until(std::chrono::steady_clock::now());
+                                    if (!ready) break;
+                                    append_task(std::move(*ready));
+                                }
+                                std::array<BlobWriteTask*, kPackWriteBatchObjects> tasks{};
+                                const auto batch_size = segment.size() - batch_begin;
+                                for (std::size_t i = 0; i < batch_size; ++i) tasks[i] = &segment[batch_begin + i];
+                                auto staged = pack->append_batch(std::span<BlobWriteTask*>(tasks.data(), batch_size));
+                                for (auto& ack : staged) acknowledgements.push_back(std::move(ack));
+                                if (segment.size() >= kPackMaxObjects || pack->bytes_written() >= kPackTargetBytes) break;
                                 auto next = object_queue.pop_until(std::chrono::steady_clock::now() + kPackIdleFlush);
                                 if (!next) break;
                                 append_task(std::move(*next));
@@ -697,7 +682,7 @@ BackupSummary backup(const BackupOptions& options) {
                 try {
                     while (auto task = object_queue.pop(&errors.cancelled)) {
                         if (errors.cancelled.load(std::memory_order_relaxed)) {
-                            try { task->promise->set_exception(std::make_exception_ptr(std::runtime_error("backup cancelled"))); } catch (...) {}
+                            try { complete_blob_task(*task, nullptr, std::make_exception_ptr(std::runtime_error("backup cancelled"))); } catch (...) {}
                             continue;
                         }
                         const auto begin = Clock::now();
@@ -705,8 +690,7 @@ BackupSummary backup(const BackupOptions& options) {
                         bool write_timings_recorded = false;
                         try {
                             if (!sleep_cancellable(options.test_writer_delay_ms, errors.cancelled)) {
-                                task->promise->set_exception(std::make_exception_ptr(std::runtime_error("backup cancelled")));
-                                continue;
+                                throw std::runtime_error("backup cancelled");
                             }
                             const auto ack = write_object(repo, job_id, *task, options.failpoint, &write_timings);
                             record_object_write(metrics, write_timings);
@@ -716,12 +700,15 @@ BackupSummary backup(const BackupOptions& options) {
                             metrics.writer_busy_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - begin).count(), std::memory_order_relaxed);
                             if (ack.new_object) metrics.new_stored_bytes.fetch_add(ack.header.stored_bytes + kObjectHeaderSize, std::memory_order_relaxed);
                             if (ack.new_object) metrics.completed_unique_raw_bytes.fetch_add(ack.header.raw_bytes, std::memory_order_relaxed);
-                            task->promise->set_value(ack);
+                            std::vector<std::uint8_t>().swap(task->stored);
+                            task->retained_credit.reset();
+                            complete_blob_task(*task, &ack, {});
                         } catch (...) {
+                            const auto failure = std::current_exception();
                             if (!write_timings_recorded) record_object_write(metrics, write_timings);
                             metrics.writer_busy_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - begin).count(), std::memory_order_relaxed);
-                            try { task->promise->set_exception(std::current_exception()); } catch (...) {}
-                            fail(std::current_exception());
+                            try { complete_blob_task(*task, nullptr, failure); } catch (...) {}
+                            fail(failure);
                         }
                     }
                 } catch (...) { fail(std::current_exception()); }
@@ -754,6 +741,35 @@ BackupSummary backup(const BackupOptions& options) {
                         if (!spin_ok)
                             throw std::runtime_error("backup cancelled during controlled CPU work");
                         const std::string id = digest_hex(digest);
+                        claim_id = id;
+                        auto [state, owner] = claims.claim(id);
+                        is_owner = owner;
+                        owner_state = state;
+                        if (!owner) {
+                            const auto raw_size = task.raw.size();
+                            std::vector<std::uint8_t>().swap(task.raw);
+                            task.credit.release();
+                            gate.release(); permit = false;
+                            const auto wait_begin = Clock::now();
+                            const auto promise = task.promise;
+                            claims.when_ready(state, [&, promise, raw_size, wait_begin](
+                                const ObjectHeader* durable, std::exception_ptr error) {
+                                metrics.duplicate_ack_wait_ns.fetch_add(elapsed_ns(wait_begin), std::memory_order_relaxed);
+                                try {
+                                    if (error) { promise->set_exception(error); return; }
+                                    if (!durable) throw std::runtime_error("duplicate claim returned no object");
+                                    auto header = *durable;
+                                    header.newly_written = false;
+                                    metrics.completed_chunks.fetch_add(1, std::memory_order_relaxed);
+                                    metrics.completed_raw_bytes.fetch_add(raw_size, std::memory_order_relaxed);
+                                    promise->set_value(std::move(header));
+                                } catch (...) {
+                                    try { promise->set_exception(std::current_exception()); } catch (...) {}
+                                }
+                            });
+                            metrics.claim_wait_ns.fetch_add(elapsed_ns(wait_begin), std::memory_order_relaxed);
+                            continue;
+                        }
                         ObjectHeader existing_header;
                         ObjectLocation existing_location;
                         std::filesystem::path stored_path;
@@ -795,22 +811,8 @@ BackupSummary backup(const BackupOptions& options) {
                             metrics.completed_chunks.fetch_add(1, std::memory_order_relaxed);
                             metrics.completed_raw_bytes.fetch_add(raw_size, std::memory_order_relaxed);
                             existing_header.newly_written = false;
+                            claims.complete(claim_id, owner_state, existing_header);
                             task.promise->set_value(existing_header);
-                            continue;
-                        }
-                        claim_id = id;
-                        auto [state, owner] = claims.claim(id);
-                        is_owner = owner;
-                        owner_state = state;
-                        if (!owner) {
-                            gate.release(); permit = false;
-                            const auto wait_begin = Clock::now();
-                            ObjectHeader header = claims.wait(state, errors.cancelled);
-                            metrics.claim_wait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - wait_begin).count(), std::memory_order_relaxed);
-                            header.newly_written = false;
-                            metrics.completed_chunks.fetch_add(1, std::memory_order_relaxed);
-                            metrics.completed_raw_bytes.fetch_add(task.raw.size(), std::memory_order_relaxed);
-                            task.promise->set_value(header);
                             continue;
                         }
 
@@ -825,8 +827,6 @@ BackupSummary backup(const BackupOptions& options) {
                         BlobWriteTask blob;
                         blob.digest = digest;
                         blob.raw_bytes = task.raw.size();
-                        blob.promise = std::make_shared<std::promise<WriteAck>>();
-                        auto ack_future = blob.promise->get_future();
                         if (compressed_size < task.raw.size()) {
                             compressed.resize(compressed_size);
                             blob.codec = 1;
@@ -837,48 +837,32 @@ BackupSummary backup(const BackupOptions& options) {
                         }
                         gate.release(); permit = false;
                         const auto queue_begin = Clock::now();
-                        if (packed_storage) {
-                            auto retained_credit = std::make_shared<MemoryBudget::Credit>(std::move(task.credit));
-                            const auto ack_begin = Clock::now();
-                            const auto promise = task.promise;
-                            blob.retained_credit = std::move(retained_credit);
-                            blob.completion = [&, claim_id, owner_state, promise, ack_begin](
-                                const WriteAck* ack, std::exception_ptr error) {
-                                const auto ack_wait = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - ack_begin).count();
-                                metrics.writer_ack_wait_ns.fetch_add(ack_wait, std::memory_order_relaxed);
-                                metrics.output_wait_ns.fetch_add(ack_wait, std::memory_order_relaxed);
-                                if (error || !ack) {
-                                    const auto failure = error ? error : std::make_exception_ptr(
-                                        std::runtime_error("pack writer returned no acknowledgement"));
-                                    claims.fail(claim_id, owner_state, failure);
-                                    try { promise->set_exception(failure); } catch (...) {}
-                                    return;
-                                }
-                                claims.complete(claim_id, owner_state, ack->header);
-                                metrics.completed_chunks.fetch_add(1, std::memory_order_relaxed);
-                                metrics.completed_raw_bytes.fetch_add(ack->header.raw_bytes, std::memory_order_relaxed);
-                                try { promise->set_value(ack->header); } catch (...) {}
-                            };
-                            const bool queued = object_queue.push(std::move(blob), &errors.cancelled);
-                            metrics.output_wait_ns.fetch_add(
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - queue_begin).count(),
-                                std::memory_order_relaxed);
-                            if (!queued) throw std::runtime_error("object writer queue closed during backup");
-                            is_owner = false; // The asynchronous completion now owns the claim and coordinator promise.
-                            continue;
-                        }
-                        const bool queued = object_queue.push(std::move(blob), &errors.cancelled);
-                        metrics.output_wait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - queue_begin).count(), std::memory_order_relaxed);
-                        if (!queued) throw std::runtime_error("object writer queue closed during backup");
+                        auto retained_credit = std::make_shared<MemoryBudget::Credit>(std::move(task.credit));
                         const auto ack_begin = Clock::now();
-                        const WriteAck ack = ack_future.get();
-                        const auto ack_wait = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - ack_begin).count();
-                        metrics.writer_ack_wait_ns.fetch_add(ack_wait, std::memory_order_relaxed);
-                        metrics.output_wait_ns.fetch_add(ack_wait, std::memory_order_relaxed);
-                        claims.complete(claim_id, state, ack.header);
-                        metrics.completed_chunks.fetch_add(1, std::memory_order_relaxed);
-                        metrics.completed_raw_bytes.fetch_add(ack.header.raw_bytes, std::memory_order_relaxed);
-                        task.promise->set_value(ack.header);
+                        const auto promise = task.promise;
+                        blob.retained_credit = std::move(retained_credit);
+                        blob.completion = [&, claim_id, owner_state, promise, ack_begin](
+                            const WriteAck* ack, std::exception_ptr error) {
+                            const auto ack_wait = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - ack_begin).count();
+                            metrics.writer_ack_wait_ns.fetch_add(ack_wait, std::memory_order_relaxed);
+                            if (error || !ack) {
+                                const auto failure = error ? error : std::make_exception_ptr(
+                                    std::runtime_error("object writer returned no acknowledgement"));
+                                claims.fail(claim_id, owner_state, failure);
+                                try { promise->set_exception(failure); } catch (...) {}
+                                return;
+                            }
+                            claims.complete(claim_id, owner_state, ack->header);
+                            metrics.completed_chunks.fetch_add(1, std::memory_order_relaxed);
+                            metrics.completed_raw_bytes.fetch_add(ack->header.raw_bytes, std::memory_order_relaxed);
+                            try { promise->set_value(ack->header); } catch (...) {}
+                        };
+                        const bool queued = object_queue.push(std::move(blob), &errors.cancelled);
+                        metrics.output_wait_ns.fetch_add(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - queue_begin).count(),
+                            std::memory_order_relaxed);
+                        if (!queued) throw std::runtime_error("object writer queue closed during backup");
+                        is_owner = false; // The asynchronous completion now owns the claim and coordinator promise.
                     } catch (...) {
                         const auto failure = std::current_exception();
                         if (permit) gate.release();
@@ -889,6 +873,24 @@ BackupSummary backup(const BackupOptions& options) {
                 }
             });
 
+        metadata_writer = std::thread([&] {
+            try {
+                while (auto batch = metadata_queue.pop(&errors.cancelled)) {
+                    if (errors.cancelled.load(std::memory_order_relaxed)) break;
+                    const auto committed = detail::commit_metadata_batch(
+                        catalog.get(), snapshot_id, *batch, options.failpoint, errors.cancelled);
+                    summary.unique_raw_bytes += committed.unique_raw_bytes;
+                    summary.reused_chunks += committed.reused_chunks;
+                    metrics.catalog_commit_ns.fetch_add(committed.transaction_ns, std::memory_order_relaxed);
+                    metrics.metadata_ack_wait_ns.fetch_add(committed.ack_wait_ns, std::memory_order_relaxed);
+                    if (!batch->entries.empty() || !batch->chunks.empty())
+                        metrics.metadata_batches.fetch_add(1, std::memory_order_relaxed);
+                    for (const auto& id : committed.object_ids) claims.release(id);
+                    metrics.progress_file_count.fetch_add(batch->completed_files, std::memory_order_relaxed);
+                }
+            } catch (...) { fail(std::current_exception()); }
+        });
+
         // A fixed 2-second control window; sampling reads only counters and bounded queue state.
         monitor = std::thread([&] {
             auto last = Clock::now();
@@ -898,6 +900,8 @@ BackupSummary backup(const BackupOptions& options) {
             std::uint64_t last_hash = 0, last_compression = 0, last_decompression = 0;
             std::uint64_t last_object_verify = 0, last_object_io = 0;
             std::uint64_t last_source_scan = 0, last_source_read = 0, last_catalog_commit = 0;
+            std::uint64_t last_metadata_ack = 0, last_metadata_queue = 0, last_metadata_batches = 0;
+            std::uint64_t last_duplicate_ack = 0, last_staging_calls = 0;
             std::uint64_t last_object_setup = 0, last_object_staging_write = 0, last_object_file_sync = 0;
             std::uint64_t last_object_publish = 0, last_object_directory_sync = 0, last_object_cleanup = 0;
             std::uint64_t last_object_existing_check = 0, last_object_write_total = 0;
@@ -906,7 +910,7 @@ BackupSummary backup(const BackupOptions& options) {
             std::uint64_t last_chunks = 0, last_bytes = 0, last_memory_wait = 0, last_gate_wait = 0;
             std::uint64_t last_unique_bytes = 0, last_stored_bytes = 0, last_progress_files = 0, last_errors = 0;
             AdaptiveController controller;
-            double input_sum = 0, object_sum = 0, memory_sum = 0;
+            double input_sum = 0, object_sum = 0, memory_sum = 0, metadata_sum = 0;
             std::uint64_t samples = 0;
             auto evaluate = [&](std::uint64_t elapsed_ns) {
                 const auto controller_begin = Clock::now();
@@ -921,6 +925,11 @@ BackupSummary backup(const BackupOptions& options) {
                 const std::uint64_t source_scan = metrics.source_scan_ns.load(std::memory_order_relaxed);
                 const std::uint64_t source_read = metrics.source_read_ns.load(std::memory_order_relaxed);
                 const std::uint64_t catalog_commit = metrics.catalog_commit_ns.load(std::memory_order_relaxed);
+                const auto metadata_ack = metrics.metadata_ack_wait_ns.load(std::memory_order_relaxed);
+                const auto metadata_wait = metrics.metadata_queue_wait_ns.load(std::memory_order_relaxed);
+                const auto metadata_batches = metrics.metadata_batches.load(std::memory_order_relaxed);
+                const auto duplicate_ack = metrics.duplicate_ack_wait_ns.load(std::memory_order_relaxed);
+                const auto staging_calls = metrics.staging_write_calls.load(std::memory_order_relaxed);
                 const std::uint64_t object_setup = metrics.object_setup_ns.load(std::memory_order_relaxed);
                 const std::uint64_t object_staging_write = metrics.object_staging_write_ns.load(std::memory_order_relaxed);
                 const std::uint64_t object_file_sync = metrics.object_file_sync_ns.load(std::memory_order_relaxed);
@@ -955,6 +964,11 @@ BackupSummary backup(const BackupOptions& options) {
                 m.source_scan_ns = source_scan - last_source_scan;
                 m.source_read_ns = source_read - last_source_read;
                 m.catalog_commit_ns = catalog_commit - last_catalog_commit;
+                m.metadata_ack_wait_ns = metadata_ack - last_metadata_ack;
+                m.metadata_queue_wait_ns = metadata_wait - last_metadata_queue;
+                m.metadata_batches = metadata_batches - last_metadata_batches;
+                m.duplicate_ack_wait_ns = duplicate_ack - last_duplicate_ack;
+                m.staging_write_calls = staging_calls - last_staging_calls;
                 m.object_setup_ns = object_setup - last_object_setup;
                 m.object_staging_write_ns = object_staging_write - last_object_staging_write;
                 m.object_file_sync_ns = object_file_sync - last_object_file_sync;
@@ -974,6 +988,7 @@ BackupSummary backup(const BackupOptions& options) {
                 m.writer_workers = options.writer_workers;
                 m.input_queue_fill = samples ? input_sum / samples : 0;
                 m.object_queue_fill = samples ? object_sum / samples : 0;
+                m.metadata_queue_fill = samples ? metadata_sum / samples : 0;
                 m.memory_used_ratio = samples ? memory_sum / samples : 0;
                 m.writer_busy_ratio = elapsed_ns ? std::clamp(
                     double(writer - last_writer) / (double(elapsed_ns) * options.writer_workers), 0.0, 1.0) : 0;
@@ -1006,6 +1021,8 @@ BackupSummary backup(const BackupOptions& options) {
                 last_hash = hash; last_compression = compression; last_decompression = decompression;
                 last_object_verify = object_verify; last_object_io = object_io;
                 last_source_scan = source_scan; last_source_read = source_read; last_catalog_commit = catalog_commit;
+                last_metadata_ack = metadata_ack; last_metadata_queue = metadata_wait; last_metadata_batches = metadata_batches;
+                last_duplicate_ack = duplicate_ack; last_staging_calls = staging_calls;
                 last_object_setup = object_setup; last_object_staging_write = object_staging_write;
                 last_object_file_sync = object_file_sync; last_object_publish = object_publish;
                 last_object_directory_sync = object_directory_sync; last_object_cleanup = object_cleanup;
@@ -1013,7 +1030,7 @@ BackupSummary backup(const BackupOptions& options) {
                 last_object_write_count = object_write_count; last_object_write_operations = object_write_operations;
                 last_chunks = chunks; last_bytes = bytes; last_memory_wait = mem_wait; last_gate_wait = gate_wait;
                 last_unique_bytes = unique_bytes; last_stored_bytes = stored_bytes; last_progress_files = progress_files; last_errors = errors_seen;
-                input_sum = object_sum = memory_sum = 0; samples = 0;
+                input_sum = object_sum = memory_sum = metadata_sum = 0; samples = 0;
             };
             while (!monitor_stop.load(std::memory_order_relaxed) && !errors.cancelled.load(std::memory_order_relaxed)) {
                 if (interrupt_requested()) {
@@ -1023,6 +1040,7 @@ BackupSummary backup(const BackupOptions& options) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 input_sum += double(input_queue.size()) / input_queue.capacity();
                 object_sum += double(object_queue.size()) / object_queue.capacity();
+                metadata_sum += double(metadata_queue.size()) / metadata_queue.capacity();
                 memory_sum += double(memory.current()) / memory.limit();
                 const std::size_t rss = current_rss_bytes();
                 std::size_t old_rss = metrics.process_rss_peak_bytes.load(std::memory_order_relaxed);
@@ -1040,20 +1058,43 @@ BackupSummary backup(const BackupOptions& options) {
 
         std::string previous_snapshot;
         std::unordered_map<std::string, CachedEntry> metadata_cache;
+        Catalog source_catalog(repo / "catalog.sqlite");
         if (options.trust_metadata && !options.paranoid)
-            metadata_cache = load_metadata_cache(catalog.get(), source_text, previous_snapshot);
+            metadata_cache = load_metadata_cache(source_catalog.get(), source_text, previous_snapshot);
         const auto source_scan_begin = Clock::now();
         const auto entries = scan_source(source, options.skip_unsupported, errors.cancelled);
         metrics.source_scan_ns.fetch_add(elapsed_ns(source_scan_begin), std::memory_order_relaxed);
+        MetadataBatch pending_metadata;
+        const auto flush_metadata = [&] {
+            if (pending_metadata.empty()) return;
+            auto batch = std::move(pending_metadata);
+            pending_metadata = {};
+            const auto begin = Clock::now();
+            if (!metadata_queue.push(std::move(batch), &errors.cancelled)) {
+                errors.rethrow();
+                throw std::runtime_error("metadata queue closed during backup");
+            }
+            metrics.metadata_queue_wait_ns.fetch_add(elapsed_ns(begin), std::memory_order_relaxed);
+        };
+        const auto queue_entry = [&](const SourceEntry& entry) {
+            pending_metadata.entries.push_back(DbEntry{entry.relative, entry.kind, entry.symlink_target,
+                entry.size, entry.mode, entry.mtime_ns});
+            if (pending_metadata.entries.size() >= 128) flush_metadata();
+        };
+        const auto queue_chunk = [&](const std::string& path, std::uint64_t ordinal,
+                                     std::uint64_t bytes, std::future<ObjectHeader> result) {
+            pending_metadata.chunks.push_back(PendingChunk{path, ordinal, bytes, std::move(result)});
+            if (pending_metadata.chunks.size() >= coordinator_batch_size) flush_metadata();
+        };
         for (const auto& entry : entries) {
             if (errors.cancelled.load(std::memory_order_relaxed)) errors.rethrow();
             if (entry.kind == "directory") {
-                snapshot_entry_transaction(catalog.get(), snapshot_id, entry, options.failpoint);
+                queue_entry(entry);
                 ++summary.directories;
                 continue;
             }
             if (entry.kind == "symlink") {
-                snapshot_entry_transaction(catalog.get(), snapshot_id, entry, options.failpoint);
+                queue_entry(entry);
                 ++summary.symlinks;
                 continue;
             }
@@ -1062,7 +1103,7 @@ BackupSummary backup(const BackupOptions& options) {
             auto cache = metadata_cache.find(entry.relative);
             if (cache != metadata_cache.end() && cache->second.kind == "file" &&
                 cache->second.size == entry.size && cache->second.mode == entry.mode && cache->second.mtime_ns == entry.mtime_ns) {
-                snapshot_entry_transaction(catalog.get(), snapshot_id, entry, options.failpoint);
+                queue_entry(entry);
                 constexpr std::size_t cache_batch_size = 128;
                 std::uint64_t next_ordinal = 0;
                 std::uint64_t expected_ordinal = 0;
@@ -1073,7 +1114,7 @@ BackupSummary backup(const BackupOptions& options) {
                         const char* query_sql = packed_storage
                             ? "SELECT c.ordinal,c.object_id,c.chunk_bytes,o.pack_id,o.pack_offset FROM entry_chunks c JOIN objects o ON o.object_id=c.object_id WHERE c.snapshot_id=? AND c.relative_path=? AND c.ordinal>=? ORDER BY c.ordinal LIMIT ?"
                             : "SELECT ordinal,object_id,chunk_bytes FROM entry_chunks WHERE snapshot_id=? AND relative_path=? AND ordinal>=? ORDER BY ordinal LIMIT ?";
-                        Statement query(catalog.get(), query_sql);
+                        Statement query(source_catalog.get(), query_sql);
                         query.text(1, previous_snapshot); query.text(2, entry.relative);
                         query.integer(3, static_cast<std::int64_t>(next_ordinal)); query.integer(4, cache_batch_size);
                         while (query.row()) {
@@ -1125,17 +1166,19 @@ BackupSummary backup(const BackupOptions& options) {
                         ++expected_ordinal;
                         cached_bytes += ref.bytes;
                     }
-                    const auto catalog_begin = Clock::now();
-                    insert_chunk_batch(catalog.get(), snapshot_id, entry.relative, refs, headers, options.failpoint);
-                    metrics.catalog_commit_ns.fetch_add(elapsed_ns(catalog_begin), std::memory_order_relaxed);
-                    summary.reused_chunks += refs.size();
+                    for (std::size_t i = 0; i < refs.size(); ++i) {
+                        std::promise<ObjectHeader> ready;
+                        auto result = ready.get_future();
+                        ready.set_value(std::move(headers[i]));
+                        queue_chunk(entry.relative, refs[i].ordinal, refs[i].bytes, std::move(result));
+                    }
                     metrics.completed_chunks.fetch_add(refs.size(), std::memory_order_relaxed);
                     metrics.completed_raw_bytes.fetch_add(cached_bytes - batch_start_bytes, std::memory_order_relaxed);
                     next_ordinal = refs.back().ordinal + 1;
                 }
                 if (cached_bytes != entry.size)
                     throw std::runtime_error("cached chunk map is incomplete for " + entry.relative);
-                metrics.progress_file_count.fetch_add(1, std::memory_order_relaxed);
+                ++pending_metadata.completed_files;
                 continue;
             }
 
@@ -1151,33 +1194,9 @@ BackupSummary backup(const BackupOptions& options) {
                 throw std::runtime_error("source changed between scan and read: " + entry.relative);
             }
 
-            try { snapshot_entry_transaction(catalog.get(), snapshot_id, entry, options.failpoint); }
+            try { queue_entry(entry); }
             catch (...) { ::close(fd); throw; }
-            std::vector<std::future<ObjectHeader>> futures;
-            std::vector<std::uint64_t> chunk_sizes;
             std::uint64_t offset = 0, ordinal = 0;
-            const std::size_t metadata_batch_size = coordinator_batch_size;
-            auto flush_chunk_batch = [&] {
-                if (futures.empty()) return;
-                std::vector<ChunkRef> refs;
-                std::vector<ObjectHeader> headers;
-                refs.reserve(futures.size()); headers.reserve(futures.size());
-                const std::size_t count = futures.size();
-                for (std::size_t i = 0; i < count; ++i) {
-                    const ObjectHeader header = futures[i].get();
-                    const auto id = digest_hex(header.digest);
-                    refs.push_back(ChunkRef{ordinal - count + i, chunk_sizes[i], id, {}});
-                    headers.push_back(header);
-                    if (header.newly_written) summary.unique_raw_bytes += header.raw_bytes;
-                    else ++summary.reused_chunks;
-                }
-                const auto catalog_begin = Clock::now();
-                insert_chunk_batch(catalog.get(), snapshot_id, entry.relative, refs, headers, options.failpoint);
-                metrics.catalog_commit_ns.fetch_add(elapsed_ns(catalog_begin), std::memory_order_relaxed);
-                for (const auto& ref : refs) claims.release(ref.object_id);
-                futures.clear();
-                chunk_sizes.clear();
-            };
             while (offset < entry.size) {
                 const std::size_t want = static_cast<std::size_t>(std::min<std::uint64_t>(kChunkSize, entry.size - offset));
                 auto credit = memory.acquire(credit_per_chunk, errors.cancelled);
@@ -1192,10 +1211,9 @@ BackupSummary backup(const BackupOptions& options) {
                 }
                 metrics.source_read_ns.fetch_add(elapsed_ns(source_read_begin), std::memory_order_relaxed);
                 auto promise = std::make_shared<std::promise<ObjectHeader>>();
-                futures.push_back(promise->get_future());
-                chunk_sizes.push_back(want);
+                auto result = promise->get_future();
                 ChunkTask task;
-                task.ordinal = ordinal++;
+                task.ordinal = ordinal;
                 task.raw = std::move(raw);
                 task.credit = std::move(credit);
                 task.promise = std::move(promise);
@@ -1204,13 +1222,14 @@ BackupSummary backup(const BackupOptions& options) {
                     errors.rethrow();
                     throw std::runtime_error("chunk queue closed during backup");
                 }
+                try { queue_chunk(entry.relative, ordinal++, want, std::move(result)); }
+                catch (...) { ::close(fd); throw; }
                 offset += want;
                 summary.read_bytes += want;
                 if (!sleep_cancellable(options.test_reader_delay_ms, errors.cancelled)) {
                     ::close(fd);
                     throw std::runtime_error("backup cancelled during source read");
                 }
-                if (futures.size() >= metadata_batch_size) flush_chunk_batch();
             }
             struct stat after{};
             if (::fstat(fd, &after) != 0) { const auto e = error_text("stat source file after read"); ::close(fd); throw std::runtime_error(e); }
@@ -1218,10 +1237,10 @@ BackupSummary backup(const BackupOptions& options) {
             if (before.st_dev != after.st_dev || before.st_ino != after.st_ino || before.st_size != after.st_size ||
                 stat_mtime_ns(before) != stat_mtime_ns(after) || stat_ctime_ns(before) != stat_ctime_ns(after))
                 throw std::runtime_error("source changed while being read: " + entry.relative);
-            flush_chunk_batch();
-            metrics.progress_file_count.fetch_add(1, std::memory_order_relaxed);
+            ++pending_metadata.completed_files;
         }
 
+        flush_metadata();
         finish_threads(false);
         errors.rethrow();
         if (interrupt_requested()) throw std::runtime_error("backup cancelled by interrupt");
@@ -1241,6 +1260,7 @@ BackupSummary backup(const BackupOptions& options) {
         summary.process_rss_peak_bytes = metrics.process_rss_peak_bytes.load(std::memory_order_relaxed);
         summary.worker_churn = metrics.worker_churn.load(std::memory_order_relaxed);
         summary.controller_overhead_seconds = metrics.controller_overhead_ns.load(std::memory_order_relaxed) / 1e9;
+        summary.metadata_batches = metrics.metadata_batches.load(std::memory_order_relaxed);
         summary.elapsed_seconds = std::chrono::duration<double>(Clock::now() - start).count();
         static_cast<SnapshotSummary&>(summary) = query_snapshot(catalog.get(), snapshot_id);
         {
@@ -1249,6 +1269,13 @@ BackupSummary backup(const BackupOptions& options) {
                 << "\",\"snapshot_id\":\"" << json_escape(snapshot_id) << "\",\"scheduler\":\"" << summary.scheduler
                 << "\",\"workers\":" << workers_count << ",\"logical_bytes\":" << summary.logical_bytes
                 << ",\"writer_workers\":" << summary.writer_workers
+                << ",\"metadata_batches\":" << metrics.metadata_batches.load(std::memory_order_relaxed)
+                << ",\"staging_write_calls\":" << metrics.staging_write_calls.load(std::memory_order_relaxed)
+                << ",\"metadata_queue_capacity\":" << metadata_queue.capacity()
+                << ",\"metadata_chunk_batch_limit\":" << coordinator_batch_size
+                << ",\"metadata_ack_wait_seconds\":" << metrics.metadata_ack_wait_ns.load(std::memory_order_relaxed) / 1e9
+                << ",\"duplicate_ack_wait_seconds\":" << metrics.duplicate_ack_wait_ns.load(std::memory_order_relaxed) / 1e9
+                << ",\"reader_metadata_queue_wait_seconds\":" << metrics.metadata_queue_wait_ns.load(std::memory_order_relaxed) / 1e9
                 << ",\"read_bytes\":" << summary.read_bytes << ",\"unique_raw_bytes\":" << summary.unique_raw_bytes
                 << ",\"new_stored_bytes\":" << summary.new_stored_bytes << ",\"reused_chunks\":" << summary.reused_chunks
                 << ",\"memory_credit_peak_bytes\":" << memory.peak() << ",\"memory_budget_bytes\":" << memory.limit()

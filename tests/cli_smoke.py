@@ -65,10 +65,10 @@ def main() -> None:
             json.loads(line)
             for line in (repo / "reports" / f"{trace_id}.jsonl").read_text(encoding="utf-8").splitlines()
         ]
-        if not trace_rows or trace_rows[0]["schema_version"] != 5:
+        if not trace_rows or trace_rows[0]["schema_version"] != 6:
             raise AssertionError("decision trace omitted the current schema version")
         stage_metrics = trace_rows[0]["observations"]
-        if not {"cpu_compute_ratio", "controlled_cpu_ms", "hash_ms", "compression_ms", "decompression_ms", "object_verify_ms", "object_io_ms", "writer_workers", "source_read_ms", "catalog_commit_ms", "object_staging_write_ms", "object_file_sync_ms", "object_publish_ms", "object_directory_sync_ms", "object_write_total_ms", "object_write_count", "object_write_operation_count"}.issubset(stage_metrics):
+        if not {"cpu_compute_ratio", "controlled_cpu_ms", "hash_ms", "compression_ms", "decompression_ms", "object_verify_ms", "object_io_ms", "writer_workers", "source_read_ms", "catalog_commit_ms", "object_staging_write_ms", "object_file_sync_ms", "object_publish_ms", "object_directory_sync_ms", "object_write_total_ms", "object_write_count", "object_write_operation_count", "metadata_queue_fill_ratio", "metadata_ack_wait_ms", "metadata_queue_wait_ms", "metadata_batches", "duplicate_ack_wait_ms", "staging_write_calls"}.issubset(stage_metrics):
             raise AssertionError(f"decision trace omitted stage timing fields: {stage_metrics}")
         if stage_metrics["writer_workers"] != 2:
             raise AssertionError(f"decision trace omitted configured object-writer count: {stage_metrics}")

@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <utility>
 
@@ -33,14 +34,38 @@ std::string error_text(std::string_view operation) {
     return std::string(operation) + ": " + std::strerror(errno);
 }
 
-void write_all(int fd, const std::uint8_t* data, std::size_t size) {
+std::uint64_t write_all(int fd, const std::uint8_t* data, std::size_t size) {
     std::size_t written = 0;
+    std::uint64_t calls = 0;
     while (written < size) {
+        ++calls;
         const ssize_t n = ::write(fd, data + written, size - written);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) throw std::runtime_error(error_text("write"));
         written += static_cast<std::size_t>(n);
     }
+    return calls;
+}
+
+std::uint64_t writev_all(int fd, iovec* vectors, std::size_t count) {
+    std::size_t first = 0;
+    std::uint64_t calls = 0;
+    while (first < count) {
+        ++calls;
+        const ssize_t n = ::writev(fd, vectors + first, static_cast<int>(count - first));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) throw std::runtime_error(error_text("writev"));
+        std::size_t bytes = static_cast<std::size_t>(n);
+        while (first < count && bytes >= vectors[first].iov_len) {
+            bytes -= vectors[first].iov_len;
+            ++first;
+        }
+        if (first < count && bytes) {
+            vectors[first].iov_base = static_cast<std::uint8_t*>(vectors[first].iov_base) + bytes;
+            vectors[first].iov_len -= bytes;
+        }
+    }
+    return calls;
 }
 
 void read_all(int fd, std::uint8_t* data, std::size_t size) {
@@ -328,8 +353,8 @@ WriteAck write_object(const std::filesystem::path& repo, const std::string& job,
     std::copy(task.digest.begin(), task.digest.end(), header.begin() + 32);
     try {
         auto phase_begin = Clock::now();
-        write_all(fd, header.data(), header.size());
-        if (!task.stored.empty()) write_all(fd, task.stored.data(), task.stored.size());
+        measured->staging_write_calls += write_all(fd, header.data(), header.size());
+        if (!task.stored.empty()) measured->staging_write_calls += write_all(fd, task.stored.data(), task.stored.size());
         measured->staging_write_ns += elapsed_ns(phase_begin);
         maybe_failpoint(failpoint, "after-temp-write");
         phase_begin = Clock::now();
@@ -420,7 +445,7 @@ struct PackWriter::Impl {
             put_le(pack_header.data() + 8, 1, 2);
             const auto write_begin = Clock::now();
             try {
-                write_all(fd, pack_header.data(), pack_header.size());
+                measured.staging_write_calls += write_all(fd, pack_header.data(), pack_header.size());
             } catch (...) {
                 measured.staging_write_ns += elapsed_ns(write_begin);
                 throw;
@@ -447,46 +472,63 @@ struct PackWriter::Impl {
         }
     }
 
-    WriteAck append(BlobWriteTask& task) {
+    std::vector<WriteAck> append_batch(std::span<BlobWriteTask*> tasks) {
         if (fd < 0 || published_successfully) throw std::runtime_error("cannot append to a closed object pack");
-        if (objects >= kPackMaxObjects) throw std::runtime_error("object pack reached its maximum object count");
-        if (task.codec > 1 || task.raw_bytes > kChunkSize || task.stored.size() > ZSTD_compressBound(kChunkSize))
-            throw std::runtime_error("object length or codec exceeds pack format limits");
-        const std::uint64_t stored_bytes = static_cast<std::uint64_t>(task.stored.size());
-        const auto max_offset = static_cast<std::uint64_t>(std::numeric_limits<off_t>::max());
-        if (bytes > max_offset - kObjectHeaderSize ||
-            stored_bytes > max_offset - bytes - kObjectHeaderSize)
-            throw std::runtime_error("object pack exceeds platform file offset limits");
-
-        WriteAck acknowledgement;
-        acknowledgement.header = ObjectHeader{task.codec, task.raw_bytes, stored_bytes, task.digest, true, pack_id, bytes};
-        acknowledgement.new_object = true;
-
-        std::array<std::uint8_t, kObjectHeaderSize> header{};
-        std::copy(kMagic.begin(), kMagic.end(), header.begin());
-        put_le(header.data() + 8, 1, 2);
-        header[10] = task.codec;
-        put_le(header.data() + 16, task.raw_bytes, 8);
-        put_le(header.data() + 24, stored_bytes, 8);
-        std::copy(task.digest.begin(), task.digest.end(), header.begin() + 32);
-
+        if (tasks.empty() || tasks.size() > kPackWriteBatchObjects || objects + tasks.size() > kPackMaxObjects)
+            throw std::runtime_error("object pack write batch exceeds its object limit");
         const auto operation_begin = Clock::now();
+        std::array<std::array<std::uint8_t, kObjectHeaderSize>, kPackWriteBatchObjects> headers{};
+        std::array<iovec, kPackWriteBatchObjects * 2> vectors{};
+        std::size_t vector_count = 0;
+        std::uint64_t next_offset = bytes;
+        std::vector<WriteAck> acknowledgements;
+        acknowledgements.reserve(tasks.size());
+        for (std::size_t i = 0; i < tasks.size(); ++i) {
+            if (!tasks[i]) throw std::runtime_error("object pack contains an empty task");
+            const auto& task = *tasks[i];
+            if (task.codec > 1 || task.raw_bytes > kChunkSize || task.stored.size() > ZSTD_compressBound(kChunkSize))
+                throw std::runtime_error("object length or codec exceeds pack format limits");
+            const auto stored_bytes = static_cast<std::uint64_t>(task.stored.size());
+            const auto max_offset = static_cast<std::uint64_t>(std::numeric_limits<off_t>::max());
+            if (next_offset > max_offset - kObjectHeaderSize || stored_bytes > max_offset - next_offset - kObjectHeaderSize)
+                throw std::runtime_error("object pack exceeds platform file offset limits");
+            acknowledgements.push_back(WriteAck{ObjectHeader{task.codec, task.raw_bytes, stored_bytes,
+                task.digest, true, pack_id, next_offset}, true});
+            auto& header = headers[i];
+            std::copy(kMagic.begin(), kMagic.end(), header.begin());
+            put_le(header.data() + 8, 1, 2);
+            header[10] = task.codec;
+            put_le(header.data() + 16, task.raw_bytes, 8);
+            put_le(header.data() + 24, stored_bytes, 8);
+            std::copy(task.digest.begin(), task.digest.end(), header.begin() + 32);
+            vectors[vector_count++] = iovec{header.data(), header.size()};
+            if (!task.stored.empty())
+                vectors[vector_count++] = iovec{tasks[i]->stored.data(), tasks[i]->stored.size()};
+            next_offset += kObjectHeaderSize + stored_bytes;
+        }
         const auto write_begin = Clock::now();
         try {
-            write_all(fd, header.data(), header.size());
-            if (!task.stored.empty()) write_all(fd, task.stored.data(), task.stored.size());
+            measured.staging_write_calls += writev_all(fd, vectors.data(), vector_count);
         } catch (...) {
             measured.staging_write_ns += elapsed_ns(write_begin);
             measured.total_ns += elapsed_ns(operation_begin);
             throw;
         }
         measured.staging_write_ns += elapsed_ns(write_begin);
-        bytes += kObjectHeaderSize + stored_bytes;
-        ++objects;
-        std::vector<std::uint8_t>().swap(task.stored);
-        task.retained_credit.reset();
+        bytes = next_offset;
+        objects += tasks.size();
+        for (auto* task : tasks) {
+            std::vector<std::uint8_t>().swap(task->stored);
+            task->retained_credit.reset();
+        }
         measured.total_ns += elapsed_ns(operation_begin);
-        return acknowledgement;
+        return acknowledgements;
+    }
+
+    WriteAck append(BlobWriteTask& task) {
+        auto* pointer = &task;
+        auto acknowledgements = append_batch(std::span<BlobWriteTask*>(&pointer, 1));
+        return std::move(acknowledgements.front());
     }
 
     void publish() {
@@ -542,6 +584,7 @@ PackWriter::~PackWriter() = default;
 PackWriter::PackWriter(PackWriter&&) noexcept = default;
 PackWriter& PackWriter::operator=(PackWriter&&) noexcept = default;
 WriteAck PackWriter::append(BlobWriteTask& task) { return impl_->append(task); }
+std::vector<WriteAck> PackWriter::append_batch(std::span<BlobWriteTask*> tasks) { return impl_->append_batch(tasks); }
 std::uint64_t PackWriter::bytes_written() const noexcept { return impl_ ? impl_->bytes : 0; }
 std::size_t PackWriter::object_count() const noexcept { return impl_ ? impl_->objects : 0; }
 void PackWriter::publish() { impl_->publish(); }

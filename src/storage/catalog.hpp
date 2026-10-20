@@ -18,6 +18,7 @@ public:
     void null(int index);
     bool row();
     void done();
+    void reset();
     std::string string(int index) const;
     std::int64_t i64(int index) const;
     bool is_null(int index) const;
