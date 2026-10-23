@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
-project(parallel_backup_engine VERSION 0.1.0 LANGUAGES CXX)
+project(paravault VERSION 0.1.0 LANGUAGES CXX)
 
-option(PBE_BUILD_TESTS "Build the PBE unit and integration tests" ON)
+option(PBE_BUILD_TESTS "Build the ParaVault unit and integration tests" ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -29,6 +29,10 @@ target_include_directories(pbe_core PUBLIC include PRIVATE src ${ZSTD_INCLUDE_DI
 target_link_libraries(pbe_core PUBLIC SQLite::SQLite3 Threads::Threads ${ZSTD_LIBRARY})
 target_compile_options(pbe_core PRIVATE -Wall -Wextra -Wpedantic)
 
+add_executable(paravault src/cli/main.cpp)
+target_link_libraries(paravault PRIVATE pbe_core)
+
+# Keep the original command available for existing scripts and benchmark reports.
 add_executable(pbe src/cli/main.cpp)
 target_link_libraries(pbe PRIVATE pbe_core)
 
@@ -41,8 +45,8 @@ if(PBE_BUILD_TESTS)
     add_test(NAME pbe_tests COMMAND pbe_tests)
     set_tests_properties(pbe_tests PROPERTIES TIMEOUT 180)
     add_test(NAME pbe_cli_smoke
-        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_smoke.py $<TARGET_FILE:pbe>)
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_smoke.py $<TARGET_FILE:paravault>)
     set_tests_properties(pbe_cli_smoke PROPERTIES TIMEOUT 60)
 endif()
 
-install(TARGETS pbe RUNTIME DESTINATION bin)
+install(TARGETS paravault pbe RUNTIME DESTINATION bin)

@@ -1,6 +1,8 @@
-# Parallel Backup & Deduplication Engine
+# ParaVault
 
-PBE is a local snapshot backup engine written in C++20 for macOS and Linux. It stores immutable BLAKE3-addressed 1 MiB chunks, compresses new objects with Zstandard, deduplicates shared content, and publishes snapshots through a SQLite catalog. The engine includes bounded producer/consumer queues, a pipeline memory budget, source-change checks, safe restore paths, full-object verification, fault-injection checkpoints, JSON Lines diagnostics, and an opt-in adaptive CPU admission controller.
+以 C++20 開發的多執行緒備份引擎，支援內容去重、壓縮、快照還原與自適應排程。
+
+ParaVault is a local snapshot backup engine written in C++20 for macOS and Linux. It stores immutable BLAKE3-addressed 1 MiB chunks, compresses new objects with Zstandard, deduplicates shared content, and publishes snapshots through a SQLite catalog. The engine includes bounded producer/consumer queues, a pipeline memory budget, source-change checks, safe restore paths, full-object verification, fault-injection checkpoints, JSON Lines diagnostics, and an opt-in adaptive CPU admission controller.
 
 The implementation is a portfolio baseline: it must not be treated as the sole copy of important data before you validate it on your own storage, restore scenarios, and failure environment. It does not replace Time Machine.
 
@@ -49,31 +51,33 @@ Start with `src/cli/main.cpp`, then follow the commands into `src/core/engine.cp
 
 ## Quick start
 
+The primary command is `paravault`. The original `pbe` command, `include/pbe` API, and `--pbe` tooling options remain available for existing scripts and repositories.
+
 ```sh
-build/pbe init --repo ~/PBERepo
-build/pbe backup --repo ~/PBERepo --source ~/Projects --workers 4
-build/pbe list --repo ~/PBERepo
-build/pbe verify --repo ~/PBERepo --snapshot <snapshot-id> --full
-build/pbe restore --repo ~/PBERepo --snapshot <snapshot-id> --target ~/RestoreTest
-build/pbe stats --repo ~/PBERepo --json
+build/paravault init --repo ~/ParaVaultRepo
+build/paravault backup --repo ~/ParaVaultRepo --source ~/Projects --workers 4
+build/paravault list --repo ~/ParaVaultRepo
+build/paravault verify --repo ~/ParaVaultRepo --snapshot <snapshot-id> --full
+build/paravault restore --repo ~/ParaVaultRepo --snapshot <snapshot-id> --target ~/RestoreTest
+build/paravault stats --repo ~/ParaVaultRepo --json
 ```
 
 Adaptive scheduling and explicit trusted-metadata reuse are opt-in:
 
 ```sh
-build/pbe backup --repo ~/PBERepo --source ~/Projects --scheduler adaptive --max-workers 8 --memory-mib 256
-build/pbe backup --repo ~/PBERepo --source ~/Projects --trust-metadata
-build/pbe explain --repo ~/PBERepo --run <run-id>
+build/paravault backup --repo ~/ParaVaultRepo --source ~/Projects --scheduler adaptive --max-workers 8 --memory-mib 256
+build/paravault backup --repo ~/ParaVaultRepo --source ~/Projects --trust-metadata
+build/paravault explain --repo ~/ParaVaultRepo --run <run-id>
 ```
 
 The default `files-v1` repository stores each unique chunk as a separate file. To experiment with batched immutable pack storage, select it when creating a new repository:
 
 ```sh
-build/pbe init --repo ~/PBERepo-Packs --storage-format pack-v2
-build/pbe backup --repo ~/PBERepo-Packs --source ~/Projects --workers 4 --writer-workers 1 --memory-mib 256
+build/paravault init --repo ~/ParaVaultRepo-Packs --storage-format pack-v2
+build/paravault backup --repo ~/ParaVaultRepo-Packs --source ~/Projects --workers 4 --writer-workers 1 --memory-mib 256
 ```
 
-`pack-v2` streams compressed chunks into temporary packs, gathering up to eight already-available objects into a `writev()` call without an extra payload buffer. Chunk buffers and credits are released after staging, while durable acknowledgements wait for pack fsync, publication, and directory sync. The writer targets 128 MiB or 256 objects and flushes after 2 ms idle; the target is not a guaranteed size. `files-v1` remains the default. Pack-v2 requires a new repository and cannot be enabled by editing an existing repository's configuration; older PBE binaries do not understand it.
+`pack-v2` streams compressed chunks into temporary packs, gathering up to eight already-available objects into a `writev()` call without an extra payload buffer. Chunk buffers and credits are released after staging, while durable acknowledgements wait for pack fsync, publication, and directory sync. The writer targets 128 MiB or 256 objects and flushes after 2 ms idle; the target is not a guaranteed size. `files-v1` remains the default. Pack-v2 requires a new repository and cannot be enabled by editing an existing repository's configuration; older engine binaries do not understand it.
 
 Backup runs the reader, CPU workers, storage writers, and a dedicated metadata consumer concurrently. The reader continues across file boundaries; CPU workers submit asynchronous writes or duplicate continuations and continue with new chunks. Metadata transactions span files and begin only after durable results arrive. See the [pipeline design](docs/PIPELINE.md), current pipeline scaling measurements (local report; not included), and earlier storage-format experiment (local report; not included).
 
@@ -93,14 +97,14 @@ On the local machine with eight logical CPUs, a generated 10.016 GiB project wit
 
 For controlled diagnostic runs, `benchmark` also accepts `--test-writer-delay-ms N`, `--test-reader-delay-ms N`, and `--test-cpu-spin-ms N`. They inject writer/input delays or CPU work and do not simulate a particular disk or processor.
 
-Reproduce the four controlled CPU, writer, memory, and input scenarios and preserve their JSONL traces with `python3 tools/run_diagnostic_scenarios.py --pbe build-release/pbe --output reports/diagnostics`; see [the diagnostics guide](docs/DIAGNOSTICS_SCHEMA.md).
+Reproduce the four controlled CPU, writer, memory, and input scenarios and preserve their JSONL traces with `python3 tools/run_diagnostic_scenarios.py --pbe build-release/paravault --output reports/diagnostics`; see [the diagnostics guide](docs/DIAGNOSTICS_SCHEMA.md).
 
 ## Local monitoring dashboard
 
-Start the local UI after building PBE:
+Start the local UI after building ParaVault:
 
 ```sh
-python3 tools/pbe_dashboard.py --pbe build-release/pbe
+python3 tools/paravault_dashboard.py --engine build-release/paravault
 ```
 
 Open `http://127.0.0.1:8765` to initialize or select a repository, choose its storage format when creating it, start a backup, choose the number of object writers, watch live throughput and pipeline diagnostics, and review recent snapshots. The dashboard binds to localhost and uses only Python's standard library. See the [dashboard guide](docs/DASHBOARD.md).
@@ -113,10 +117,10 @@ Create deterministic A-F dataset profiles and run the fixed/adaptive comparison 
 
 ```sh
 python3 tools/generate_dataset.py --output fixtures --profiles A,B,C,D,E,F --size-mib 32
-python3 tools/run_benchmark.py --pbe build/pbe --fixtures fixtures --output reports/benchmark --repeat 5
+python3 tools/run_benchmark.py --pbe build/paravault --fixtures fixtures --output reports/benchmark --repeat 5
 ```
 
-Read [docs/BENCHMARK.md](docs/BENCHMARK.md) before comparing results. PBE reports local observations; it does not claim a guaranteed speedup or a physical disk bottleneck.
+Read [docs/BENCHMARK.md](docs/BENCHMARK.md) before comparing results. ParaVault reports local observations; it does not claim a guaranteed speedup or a physical disk bottleneck.
 
 ## Current implementation and validation
 

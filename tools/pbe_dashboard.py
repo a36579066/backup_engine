@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the local PBE backup monitoring dashboard (Python standard library only)."""
+"""Run the local ParaVault backup monitoring dashboard (Python standard library only)."""
 
 from __future__ import annotations
 
@@ -157,7 +157,7 @@ class BackupManager:
         if storage_format not in {"files-v1", "pack-v2"}:
             raise ValueError("不支援的儲存格式。")
         if (repo / "catalog.sqlite").exists():
-            raise ValueError("這個路徑已經是 PBE 儲存庫。")
+            raise ValueError("這個路徑已經是 ParaVault 儲存庫。")
         completed = subprocess.run(
             [str(self.pbe), "init", "--repo", str(repo), "--storage-format", storage_format],
             text=True,
@@ -274,7 +274,7 @@ class BackupManager:
                 job["state"] = "cancelled"
             else:
                 job["state"] = "failed"
-                job["error"] = stderr.strip() or stdout.strip() or f"PBE exited with code {process.returncode}"
+                job["error"] = stderr.strip() or stdout.strip() or f"ParaVault exited with code {process.returncode}"
 
     def stop(self) -> dict[str, Any]:
         with self.lock:
@@ -398,7 +398,7 @@ class BackupManager:
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
-    server_version = "PBE-Dashboard/1.0"
+    server_version = "ParaVault-Dashboard/0.1.0"
 
     def __init__(self, *args: Any, manager: BackupManager, **kwargs: Any):
         self.manager = manager
@@ -515,7 +515,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pbe", type=Path, help="PBE CLI executable (defaults to build/pbe or build-release/pbe)")
+    parser.add_argument("--engine", "--pbe", dest="pbe", type=Path, metavar="PATH",
+                        help="ParaVault CLI executable (defaults to build/paravault or build-release/paravault; legacy pbe is also supported)")
     parser.add_argument("--host", default="127.0.0.1", help="Loopback address to bind (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8765, help="Local dashboard port (default: 8765)")
     args = parser.parse_args()
@@ -526,10 +527,11 @@ def parse_args() -> argparse.Namespace:
     if args.pbe:
         args.pbe = args.pbe.expanduser().resolve()
     else:
-        candidates = [ROOT / "build" / "pbe", ROOT / "build-release" / "pbe"]
+        candidates = [ROOT / "build" / "paravault", ROOT / "build-release" / "paravault",
+                      ROOT / "build" / "pbe", ROOT / "build-release" / "pbe"]
         args.pbe = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
     if not args.pbe.is_file() or not os.access(args.pbe, os.X_OK):
-        parser.error(f"PBE executable is missing or not executable: {args.pbe}; build the project or pass --pbe")
+        parser.error(f"ParaVault executable is missing or not executable: {args.pbe}; build the project or pass --engine")
     return args
 
 
@@ -541,8 +543,8 @@ def main() -> None:
     )
     server = ThreadingHTTPServer((args.host, args.port), handler)
     server.daemon_threads = True
-    print(f"PBE backup dashboard: http://{args.host}:{args.port}")
-    print(f"PBE executable: {args.pbe}")
+    print(f"ParaVault backup dashboard: http://{args.host}:{args.port}")
+    print(f"ParaVault executable: {args.pbe}")
     print("Press Ctrl-C to stop the dashboard server.")
     try:
         server.serve_forever(poll_interval=0.25)

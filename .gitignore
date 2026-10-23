@@ -1,6 +1,7 @@
 /build/
 /build-*/
 /pbe-benchmark/
+/.git-history/
 __pycache__/
 *.pyc
 .DS_Store

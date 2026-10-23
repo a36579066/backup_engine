@@ -167,22 +167,22 @@ std::string format_time_ns(std::int64_t value) {
 }
 
 void print_usage(std::ostream& out) {
-    out << R"(Parallel Backup & Deduplication Engine (PBE)
+    out << R"(ParaVault — Multithreaded Backup Engine (C++20)
 
 Usage:
-  pbe init --repo PATH
+  paravault init --repo PATH
            [--storage-format files-v1|pack-v2]
-  pbe backup --repo PATH --source PATH [--workers N] [--memory-mib N]
+  paravault backup --repo PATH --source PATH [--workers N] [--memory-mib N]
              [--scheduler fixed|adaptive] [--max-workers N]
              [--writer-workers N]
              [--skip-unsupported] [--trust-metadata | --paranoid]
-  pbe list --repo PATH
-  pbe show --repo PATH --snapshot ID
-  pbe restore --repo PATH --snapshot ID --target PATH
-  pbe verify --repo PATH --snapshot ID [--full]
-  pbe stats --repo PATH [--json]
-  pbe explain --repo PATH --run RUN_ID [--json]
-  pbe benchmark --dataset PATH [--workers 1,2,4,8] [--repeat N]
+  paravault list --repo PATH
+  paravault show --repo PATH --snapshot ID
+  paravault restore --repo PATH --snapshot ID --target PATH
+  paravault verify --repo PATH --snapshot ID [--full]
+  paravault stats --repo PATH [--json]
+  paravault explain --repo PATH --run RUN_ID [--json]
+  paravault benchmark --dataset PATH [--workers 1,2,4,8] [--repeat N]
                 [--compare-schedulers fixed,adaptive] [--memory-mib N]
                 [--writer-workers N] [--storage-format files-v1|pack-v2]
                 [--output PATH] [--test-writer-delay-ms N]
@@ -355,9 +355,9 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, on_sigint);
     try { return run(argc, argv); }
     catch (const std::exception& error) {
-        std::cerr << "pbe: " << error.what() << '\n';
+        std::cerr << "paravault: " << error.what() << '\n';
         const int code = error_code(error);
-        if (code == 2) { std::cerr << "Run 'pbe --help' for usage.\n"; return 2; }
+        if (code == 2) { std::cerr << "Run 'paravault --help' for usage.\n"; return 2; }
         return code;
     }
 }
