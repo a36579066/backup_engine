@@ -15,8 +15,8 @@ struct ControllerDecision {
     bool limit_changed = false;
 };
 
-// Stateful admission policy. The coordinator applies the returned limit to
-// ActiveWorkerGate and records the decision in the trace.
+// Choose CPU admission from consecutive windows without directly manipulating threads or queues.
+// The monitor applies decisions to ActiveWorkerGate and records their reasons and outcomes.
 class AdaptiveController {
 public:
     ControllerDecision evaluate(const WindowSample& sample, Diagnosis diagnosis,

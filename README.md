@@ -30,24 +30,40 @@ ctest --test-dir build --output-on-failure
 
 The project contains a compact unkeyed BLAKE3-256 implementation based on the public BLAKE3 specification, so the build does not fetch dependencies over the network. SQLite and Zstandard are linked from the system packages.
 
+## 架構概覽
+
+備份時，主執行緒持續讀檔切塊，CPU 與儲存工作者在背景處理已送出的區塊。Reader 另外送出檔案與區塊對應資訊，紀錄工作者等保存結果就緒後才提交資料庫。
+
+```mermaid
+flowchart LR
+    R["01 Reader<br/>主執行緒讀檔切塊"] -->|"input_queue"| C["02 CPU 工作者<br/>指紋、去重、壓縮"]
+    C -->|"object_queue"| W["03 儲存工作者<br/>寫入、同步、發布"]
+    R -->|"metadata_queue"| M["04 紀錄工作者<br/>等保存結果、批次提交"]
+    W -. "promise / future：保存完成" .-> M
+    C -. "promise / future：重用結果" .-> M
+    M --> DB["SQLite<br/>還原用的檔案與區塊對應表"]
+```
+
+不同階段可同時處理不同區塊。01 Reader 在 framework 中登記為 Source，02～04 登記為 Worker stages，Monitor 則是 Observer；所有設定集中在 `configure_stages()`。主流程透過 `pipeline.run()` 完成啟動、來源執行與收尾，成功後才將快照發布為 `COMPLETE`。完整的[啟動、收尾與資料交接流程圖](docs/ARCHITECTURE.md)也標出對應的程式碼入口。
+
 ## Source layout
 
 ```text
 include/pbe/       Public engine API, BLAKE3 API, and bounded queue
 src/
 ├── cli/           Command-line entry point and arguments
-├── core/          Backup coordination and engine operations
+├── core/          Backup coordination, snapshot lifecycle, and query operations
 ├── storage/       SQLite catalog, repository, objects, and packs
 ├── concurrency/   Memory credits, deduplication claims, and worker pool
-├── scheduler/     Worker admission and adaptive scheduling
+├── scheduler/     Worker admission, adaptive CPU scheduling, and I/O policy limits
 ├── diagnostics/   Bottleneck classification and trace serialization
 ├── hashing/       BLAKE3 implementation
-├── pipeline/      Cross-file metadata batches and durable-result commits
+├── pipeline/      00 framework; 01 reader → 02 CPU → 03 storage; 04 metadata branch
 ├── restore/       Snapshot restoration
 └── benchmark/     Benchmark orchestration and reports
 ```
 
-Start with `src/cli/main.cpp`, then follow the commands into `src/core/engine.cpp`. The full file map and module responsibilities are in [ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Start with `src/cli/main.cpp`, then read the short backup workflow in [`src/core/backup_coordinator.cpp`](src/core/backup_coordinator.cpp). The reusable runtime is under `src/pipeline/00_framework`; numbered directories `01_reader` through `04_metadata` follow data flow and reading order. Backup-specific wiring stays in `src/pipeline/backup_pipeline.cpp`. The full file map and a reading route are in [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Quick start
 
@@ -61,6 +77,15 @@ build/paravault verify --repo ~/ParaVaultRepo --snapshot <snapshot-id> --full
 build/paravault restore --repo ~/ParaVaultRepo --snapshot <snapshot-id> --target ~/RestoreTest
 build/paravault stats --repo ~/ParaVaultRepo --json
 ```
+
+I/O scheduling is selectable without changing the repository format. The default `streaming` policy overlaps source reads and downstream work. The experimental `phased` policy reads a bounded batch, dispatches it, then waits for every durable object acknowledgement before reading the next batch:
+
+```sh
+build/paravault backup --repo ~/ParaVaultRepo --source ~/Projects --io-strategy phased --memory-mib 256
+build/paravault backup --repo ~/ParaVaultRepo --source ~/Projects --io-strategy phased --memory-mib 256 --io-batch-mib 32
+```
+
+`--io-batch-mib` caps raw batch size for `phased`; 0 selects capacity automatically. Complete raw/compression credits still cap the actual batch, reported as `I/O Batch Chunks`. For example, 256 MiB of credits currently permits 127 full chunks. The credit limit does not cap total process RSS. Phasing changes overlap, pack sizes and sync frequency, so it is not assumed faster. See the [policy design](docs/PIPELINE.md#reader-的兩種-io-排程) and [comparison workflow](docs/BENCHMARK.md).
 
 Adaptive scheduling and explicit trusted-metadata reuse are opt-in:
 
@@ -78,6 +103,10 @@ build/paravault backup --repo ~/ParaVaultRepo-Packs --source ~/Projects --worker
 ```
 
 `pack-v2` streams compressed chunks into temporary packs, gathering up to eight already-available objects into a `writev()` call without an extra payload buffer. Chunk buffers and credits are released after staging, while durable acknowledgements wait for pack fsync, publication, and directory sync. The writer targets 128 MiB or 256 objects and flushes after 2 ms idle; the target is not a guaranteed size. `files-v1` remains the default. Pack-v2 requires a new repository and cannot be enabled by editing an existing repository's configuration; older engine binaries do not understand it.
+
+On macOS, object and pack publication first use hard links. If the destination filesystem rejects hard links, the engine tries `renamex_np(RENAME_EXCL)` to publish the completed staging file without replacing an existing destination. This supports the tested external FAT32 volume without changing the repository format or copying payloads a second time. Filesystems that support neither operation fail explicitly; the engine never falls back to a rename that can overwrite existing data. This does not establish power-loss durability for removable media.
+
+Catalog query connections enforce SQLite `query_only=ON`. On the tested macOS FAT32 filesystem, they use a read/write file handle to permit SQLite WAL maintenance; native read-only handles produced `SQLITE_IOERR_WRITE` after an interrupted backup. Other filesystems retain native read-only query handles. Queries cannot change application metadata, but FAT32 verification may update SQLite's maintenance files. Recovery ignores macOS AppleDouble `._` sidecars when identifying orphan packs.
 
 Backup runs the reader, CPU workers, storage writers, and a dedicated metadata consumer concurrently. The reader continues across file boundaries; CPU workers submit asynchronous writes or duplicate continuations and continue with new chunks. Metadata transactions span files and begin only after durable results arrive. See the [pipeline design](docs/PIPELINE.md), current pipeline scaling measurements (local report; not included), and earlier storage-format experiment (local report; not included).
 
@@ -124,6 +153,10 @@ Read [docs/BENCHMARK.md](docs/BENCHMARK.md) before comparing results. ParaVault 
 
 ## Current implementation and validation
 
-The repository implements the P0 backup, deduplication, compression, snapshot, restore, and verify paths, plus opt-in trusted-metadata reuse, symlink metadata, metrics traces, explain output, fault injection, a conservative adaptive CPU gate, and fresh-repository benchmark tooling. The code responsibility map is in [ARCHITECTURE.md](docs/ARCHITECTURE.md). The CMake test suite covers chunk/hash/codec boundaries, Unicode paths, queue and process cancellation, worker counts 1/2/4/8, metadata preservation, corrupted objects, CLI flows, recovery after crashes, and the five process-crash checkpoints. See the detailed [test matrix](docs/TESTING.md) and validation record (local report; not included). A six-profile, five-repeat campaign was run on the local macOS arm64 machine; see the benchmark report (local report; not included). The four injected diagnostic scenarios and traces are in reports/diagnostics (local report; not included). These local runs validate the tooling and correctness path, not target-device performance. Linux CI, sanitizer support beyond UBSan, and platform-specific power-loss validation still need confirmation in their target environments.
+The repository implements the P0 backup, deduplication, compression, snapshot, restore, and verify paths, plus opt-in trusted-metadata reuse, symlink metadata, metrics traces, explain output, fault injection, a conservative adaptive CPU gate, and fresh-repository benchmark tooling. The code responsibility map is in [ARCHITECTURE.md](docs/ARCHITECTURE.md). The CMake test suite covers chunk/hash/codec boundaries, Unicode paths, queue and process cancellation, worker counts 1/2/4/8, metadata preservation, corrupted objects, CLI flows, recovery after crashes, and the five process-crash checkpoints. See the detailed [test matrix](docs/TESTING.md). Generated benchmark reports, fixtures, and backup repositories are kept locally and are not distributed with the source. Reproduce measurements on the target machine using the benchmark tools above. Linux CI, sanitizer support beyond UBSan, and platform-specific power-loss validation still need confirmation in their target environments.
 
 Detailed design notes are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/FORMAT.md](docs/FORMAT.md), [docs/FAILURE_MODEL.md](docs/FAILURE_MODEL.md), [docs/SCHEDULER_ADR.md](docs/SCHEDULER_ADR.md), and [docs/DIAGNOSTICS_SCHEMA.md](docs/DIAGNOSTICS_SCHEMA.md).
+
+## License
+
+ParaVault is distributed under the [MIT License](LICENSE). Dependency licenses and algorithm references are documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

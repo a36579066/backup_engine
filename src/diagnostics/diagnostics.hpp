@@ -6,6 +6,7 @@
 #include <string_view>
 
 namespace pbe::detail {
+// Work, queue levels, and wait ratios from one observation window for diagnosis and control.
 struct WindowSample {
     std::uint64_t elapsed_ns = 0;
     std::uint64_t controlled_cpu_ns = 0;
@@ -39,6 +40,11 @@ struct WindowSample {
     std::uint64_t progress_file_count = 0;
     std::uint64_t error_count = 0;
     std::size_t writer_workers = 1;
+    std::string io_strategy = "streaming";
+    std::size_t io_batch_chunks = 0;
+    std::uint64_t io_batches_completed = 0;
+    std::uint64_t io_drain_wait_ns_total = 0;
+    bool io_draining = false;
     double input_queue_fill = 0;
     double object_queue_fill = 0;
     double metadata_queue_fill = 0;
@@ -53,12 +59,14 @@ struct WindowSample {
     double throughput_bytes_per_sec = 0;
 };
 
+// Rule-based hypotheses; confidence and alternative explanations preserve diagnostic uncertainty.
 struct Diagnosis {
     std::string classification = "UNKNOWN";
     std::string confidence = "low";
     std::string rule_id = "INSUFFICIENT_DATA";
     std::string reason = "Not enough work was observed in this control window.";
-    std::string hypotheses = "Input, CPU, memory, and writer limits are not distinguishable from this sample.";
+    std::string hypotheses =
+        "Input, CPU, memory, and writer limits are not distinguishable from this sample.";
 };
 
 Diagnosis classify(const WindowSample& sample);

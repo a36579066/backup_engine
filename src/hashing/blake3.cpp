@@ -6,22 +6,24 @@
 
 namespace pbe {
 namespace {
-constexpr std::array<std::uint32_t, 8> kIv = {
-    0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
-    0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u};
-constexpr std::array<std::uint8_t, 16> kPermutation = {
-    2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8};
+constexpr std::array<std::uint32_t, 8> kIv = {0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
+                                              0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u};
+constexpr std::array<std::uint8_t, 16> kPermutation = {2, 6,  3,  10, 7, 0,  4,  13,
+                                                       1, 11, 12, 5,  9, 14, 15, 8};
 constexpr std::uint32_t kChunkStart = 1u;
 constexpr std::uint32_t kChunkEnd = 2u;
 constexpr std::uint32_t kParent = 4u;
 constexpr std::uint32_t kRoot = 8u;
 constexpr std::size_t kBlockLen = 64;
+
+// BLAKE3's internal 1 KiB chunks are distinct from the backup pipeline's 1 MiB chunks.
 constexpr std::size_t kChunkLen = 1024;
 
 std::uint32_t load32(const std::uint8_t* p) {
-    return std::uint32_t(p[0]) | (std::uint32_t(p[1]) << 8) |
-           (std::uint32_t(p[2]) << 16) | (std::uint32_t(p[3]) << 24);
+    return std::uint32_t(p[0]) | (std::uint32_t(p[1]) << 8) | (std::uint32_t(p[2]) << 16) |
+           (std::uint32_t(p[3]) << 24);
 }
+
 void store32(std::uint8_t* p, std::uint32_t x) {
     p[0] = static_cast<std::uint8_t>(x);
     p[1] = static_cast<std::uint8_t>(x >> 8);
@@ -29,8 +31,8 @@ void store32(std::uint8_t* p, std::uint32_t x) {
     p[3] = static_cast<std::uint8_t>(x >> 24);
 }
 
-void g(std::array<std::uint32_t, 16>& s, int a, int b, int c, int d,
-       std::uint32_t mx, std::uint32_t my) {
+void g(std::array<std::uint32_t, 16>& s, int a, int b, int c, int d, std::uint32_t mx,
+       std::uint32_t my) {
     s[a] = s[a] + s[b] + mx;
     s[d] = std::rotr(s[d] ^ s[a], 16);
     s[c] += s[d];
@@ -41,10 +43,10 @@ void g(std::array<std::uint32_t, 16>& s, int a, int b, int c, int d,
     s[b] = std::rotr(s[b] ^ s[c], 7);
 }
 
-std::array<std::uint32_t, 16> compress(
-    const std::array<std::uint32_t, 8>& cv,
-    const std::array<std::uint32_t, 16>& block,
-    std::uint64_t counter, std::uint32_t block_len, std::uint32_t flags) {
+std::array<std::uint32_t, 16> compress(const std::array<std::uint32_t, 8>& cv,
+                                       const std::array<std::uint32_t, 16>& block,
+                                       std::uint64_t counter, std::uint32_t block_len,
+                                       std::uint32_t flags) {
     std::array<std::uint32_t, 16> s{};
     std::copy(cv.begin(), cv.end(), s.begin());
     std::copy_n(kIv.begin(), 4, s.begin() + 8);
@@ -63,7 +65,8 @@ std::array<std::uint32_t, 16> compress(
         g(s, 2, 7, 8, 13, m[12], m[13]);
         g(s, 3, 4, 9, 14, m[14], m[15]);
         std::array<std::uint32_t, 16> next{};
-        for (std::size_t i = 0; i < 16; ++i) next[i] = m[kPermutation[i]];
+        for (std::size_t i = 0; i < 16; ++i)
+            next[i] = m[kPermutation[i]];
         m = next;
     }
     for (std::size_t i = 0; i < 8; ++i) {
@@ -86,10 +89,12 @@ struct Output {
         std::copy_n(words.begin(), 8, out.begin());
         return out;
     }
+
     Digest root_digest() const {
         const auto words = compress(cv, block, 0, block_len, flags | kRoot);
         Digest out{};
-        for (std::size_t i = 0; i < 8; ++i) store32(out.data() + i * 4, words[i]);
+        for (std::size_t i = 0; i < 8; ++i)
+            store32(out.data() + i * 4, words[i]);
         return out;
     }
 };
@@ -98,7 +103,8 @@ std::array<std::uint32_t, 16> block_words(std::span<const std::uint8_t> bytes) {
     std::array<std::uint8_t, kBlockLen> padded{};
     std::copy(bytes.begin(), bytes.end(), padded.begin());
     std::array<std::uint32_t, 16> words{};
-    for (std::size_t i = 0; i < words.size(); ++i) words[i] = load32(padded.data() + i * 4);
+    for (std::size_t i = 0; i < words.size(); ++i)
+        words[i] = load32(padded.data() + i * 4);
     return words;
 }
 
@@ -107,8 +113,7 @@ Output chunk_output(std::span<const std::uint8_t> chunk, std::uint64_t chunk_cou
     const std::size_t blocks = std::max<std::size_t>(1, (chunk.size() + kBlockLen - 1) / kBlockLen);
     for (std::size_t i = 0; i + 1 < blocks; ++i) {
         auto words = block_words(chunk.subspan(i * kBlockLen, kBlockLen));
-        const auto out = compress(cv, words, chunk_counter, kBlockLen,
-                                  i == 0 ? kChunkStart : 0u);
+        const auto out = compress(cv, words, chunk_counter, kBlockLen, i == 0 ? kChunkStart : 0u);
         std::copy_n(out.begin(), 8, cv.begin());
     }
     const std::size_t offset = (blocks - 1) * kBlockLen;
@@ -142,7 +147,8 @@ Digest blake3(std::span<const std::uint8_t> input) {
     }
     const std::size_t last_offset = (chunks - 1) * kChunkLen;
     Output output = chunk_output(input.subspan(last_offset), chunks - 1);
-    while (stack_len > 0) output = parent_output(stack[--stack_len], output.chaining_value());
+    while (stack_len > 0)
+        output = parent_output(stack[--stack_len], output.chaining_value());
     return output.root_digest();
 }
 
@@ -158,17 +164,22 @@ std::string digest_hex(const Digest& digest) {
 }
 
 Digest digest_from_hex(const std::string& hex) {
-    if (hex.size() != 64) throw std::invalid_argument("digest must contain 64 hex characters");
+    if (hex.size() != 64)
+        throw std::invalid_argument("digest must contain 64 hex characters");
     auto digit = [](char c) -> int {
-        if (c >= '0' && c <= '9') return c - '0';
-        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        if (c >= '0' && c <= '9')
+            return c - '0';
+        if (c >= 'a' && c <= 'f')
+            return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F')
+            return c - 'A' + 10;
         return -1;
     };
     Digest out{};
     for (std::size_t i = 0; i < out.size(); ++i) {
         const int hi = digit(hex[2 * i]), lo = digit(hex[2 * i + 1]);
-        if (hi < 0 || lo < 0) throw std::invalid_argument("invalid digest hex");
+        if (hi < 0 || lo < 0)
+            throw std::invalid_argument("invalid digest hex");
         out[i] = static_cast<std::uint8_t>((hi << 4) | lo);
     }
     return out;

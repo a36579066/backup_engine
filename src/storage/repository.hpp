@@ -9,12 +9,14 @@ bool path_within(const std::filesystem::path& child, const std::filesystem::path
 void validate_repo(const std::filesystem::path& repo);
 std::uint32_t repository_format_version(const std::filesystem::path& repo);
 
+// RAII file lock serializes exclusive repository operations and releases its descriptor on destruction.
 class RepoLock {
 public:
     explicit RepoLock(const std::filesystem::path& repo);
     ~RepoLock();
     RepoLock(const RepoLock&) = delete;
     RepoLock& operator=(const RepoLock&) = delete;
+
 private:
     int fd_ = -1;
 };

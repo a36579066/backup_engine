@@ -11,6 +11,7 @@
 #include <sqlite3.h>
 
 namespace pbe::detail {
+// Snapshot path metadata; ordered ChunkRefs describe the file's stored content.
 struct DbEntry {
     std::string path, kind, symlink_target;
     std::uint64_t size = 0;
@@ -18,6 +19,7 @@ struct DbEntry {
     std::int64_t mtime_ns = 0;
 };
 
+// ordinal defines restore order, object_id identifies content, location identifies pack bytes.
 struct ChunkRef {
     std::uint64_t ordinal = 0, bytes = 0;
     std::string object_id;
@@ -31,5 +33,7 @@ SnapshotSummary query_snapshot(sqlite3* db, const std::string& snapshot);
 std::vector<ChunkRef> load_chunks(sqlite3* db, const std::string& snapshot, const std::string& path,
                                   bool packed_storage = false);
 std::optional<ObjectLocation> lookup_object_location(sqlite3* db, const std::string& object_id);
+
+// Validate contiguous ordinals and total lengths before publication and restore.
 void ensure_chunk_layout(sqlite3* db, const std::string& snapshot);
 } // namespace pbe::detail

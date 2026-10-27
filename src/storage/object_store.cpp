@@ -1,4 +1,5 @@
 #include "storage/object_store.hpp"
+#include "storage/file_publication.hpp"
 
 #include <algorithm>
 #include <array>
@@ -26,8 +27,8 @@
 namespace pbe::detail {
 namespace {
 using Clock = std::chrono::steady_clock;
-constexpr std::array<std::uint8_t, 8> kMagic{'P','B','E','O','B','J','1',0};
-constexpr std::array<std::uint8_t, 8> kPackMagic{'P','B','E','P','A','C','K','2'};
+constexpr std::array<std::uint8_t, 8> kMagic{'P', 'B', 'E', 'O', 'B', 'J', '1', 0};
+constexpr std::array<std::uint8_t, 8> kPackMagic{'P', 'B', 'E', 'P', 'A', 'C', 'K', '2'};
 constexpr std::size_t kPackHeaderSize = 16;
 
 std::string error_text(std::string_view operation) {
@@ -40,8 +41,10 @@ std::uint64_t write_all(int fd, const std::uint8_t* data, std::size_t size) {
     while (written < size) {
         ++calls;
         const ssize_t n = ::write(fd, data + written, size - written);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) throw std::runtime_error(error_text("write"));
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            throw std::runtime_error(error_text("write"));
         written += static_cast<std::size_t>(n);
     }
     return calls;
@@ -53,8 +56,10 @@ std::uint64_t writev_all(int fd, iovec* vectors, std::size_t count) {
     while (first < count) {
         ++calls;
         const ssize_t n = ::writev(fd, vectors + first, static_cast<int>(count - first));
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) throw std::runtime_error(error_text("writev"));
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            throw std::runtime_error(error_text("writev"));
         std::size_t bytes = static_cast<std::size_t>(n);
         while (first < count && bytes >= vectors[first].iov_len) {
             bytes -= vectors[first].iov_len;
@@ -72,8 +77,10 @@ void read_all(int fd, std::uint8_t* data, std::size_t size) {
     std::size_t read_bytes = 0;
     while (read_bytes < size) {
         const ssize_t n = ::read(fd, data + read_bytes, size - read_bytes);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) throw std::runtime_error("unexpected end of file while reading repository data");
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            throw std::runtime_error("unexpected end of file while reading repository data");
         read_bytes += static_cast<std::size_t>(n);
     }
 }
@@ -86,25 +93,31 @@ void pread_all(int fd, std::uint8_t* data, std::size_t size, std::uint64_t offse
         const auto current = offset + read_bytes;
         if (current > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()))
             throw std::runtime_error("object offset exceeds platform limits");
-        const ssize_t n = ::pread(fd, data + read_bytes, size - read_bytes, static_cast<off_t>(current));
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) throw std::runtime_error("unexpected end of file while reading repository data");
+        const ssize_t n =
+            ::pread(fd, data + read_bytes, size - read_bytes, static_cast<off_t>(current));
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            throw std::runtime_error("unexpected end of file while reading repository data");
         read_bytes += static_cast<std::size_t>(n);
     }
 }
 
 void put_le(std::uint8_t* out, std::uint64_t value, std::size_t bytes) {
-    for (std::size_t i = 0; i < bytes; ++i) out[i] = static_cast<std::uint8_t>(value >> (8 * i));
+    for (std::size_t i = 0; i < bytes; ++i)
+        out[i] = static_cast<std::uint8_t>(value >> (8 * i));
 }
 
 std::uint64_t get_le(const std::uint8_t* in, std::size_t bytes) {
     std::uint64_t value = 0;
-    for (std::size_t i = 0; i < bytes; ++i) value |= std::uint64_t(in[i]) << (8 * i);
+    for (std::size_t i = 0; i < bytes; ++i)
+        value |= std::uint64_t(in[i]) << (8 * i);
     return value;
 }
 
 std::uint64_t elapsed_ns(Clock::time_point start) {
-    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
 }
 
 std::string random_id(std::string_view prefix) {
@@ -112,9 +125,11 @@ std::string random_id(std::string_view prefix) {
     std::mt19937_64 rng((std::uint64_t(rd()) << 32) ^ rd() ^
                         static_cast<std::uint64_t>(Clock::now().time_since_epoch().count()));
     const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
     std::ostringstream out;
-    out << prefix << now << '-' << std::hex << std::setfill('0') << std::setw(12) << (rng() & 0xffffffffffffull);
+    out << prefix << now << '-' << std::hex << std::setfill('0') << std::setw(12)
+        << (rng() & 0xffffffffffffull);
     return out.str();
 }
 
@@ -137,15 +152,18 @@ std::filesystem::path pack_path(const std::filesystem::path& repo, const std::st
 void validate_pack_header(int fd, const std::filesystem::path& path) {
     std::array<std::uint8_t, kPackHeaderSize> bytes{};
     pread_all(fd, bytes.data(), bytes.size(), 0);
-    if (!std::equal(kPackMagic.begin(), kPackMagic.end(), bytes.begin()) || get_le(bytes.data() + 8, 2) != 1)
+    if (!std::equal(kPackMagic.begin(), kPackMagic.end(), bytes.begin()) ||
+        get_le(bytes.data() + 8, 2) != 1)
         throw std::runtime_error("pack header mismatch: " + path.string());
     for (std::size_t i = 10; i < bytes.size(); ++i)
-        if (bytes[i] != 0) throw std::runtime_error("pack has unsupported flags: " + path.string());
+        if (bytes[i] != 0)
+            throw std::runtime_error("pack has unsupported flags: " + path.string());
 }
 } // namespace
 
 VerifiedObjectCache::VerifiedObjectCache(std::size_t capacity)
-    : capacity_(std::max<std::size_t>(1, capacity)) {}
+    : capacity_(std::max<std::size_t>(1, capacity)) {
+}
 
 bool VerifiedObjectCache::contains_or_insert(const std::string& object_id) {
     std::lock_guard lock(mutex_);
@@ -184,50 +202,80 @@ std::filesystem::path object_path(const std::filesystem::path& repo, const std::
 
 ObjectHeader read_object_header(const std::filesystem::path& path) {
     int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) throw std::runtime_error(error_text("open object " + path.string()));
+    if (fd < 0)
+        throw std::runtime_error(error_text("open object " + path.string()));
     std::array<std::uint8_t, kObjectHeaderSize> bytes{};
-    try { read_all(fd, bytes.data(), bytes.size()); }
-    catch (...) { ::close(fd); throw; }
+    try {
+        read_all(fd, bytes.data(), bytes.size());
+    } catch (...) {
+        ::close(fd);
+        throw;
+    }
     struct stat st{};
-    if (::fstat(fd, &st) != 0) { const auto e = error_text("stat object"); ::close(fd); throw std::runtime_error(e); }
+    if (::fstat(fd, &st) != 0) {
+        const auto e = error_text("stat object");
+        ::close(fd);
+        throw std::runtime_error(e);
+    }
     ::close(fd);
-    if (!S_ISREG(st.st_mode)) throw std::runtime_error("object path is not a regular file: " + path.string());
-    if (!std::equal(kMagic.begin(), kMagic.end(), bytes.begin())) throw std::runtime_error("object magic mismatch: " + path.string());
-    if (get_le(bytes.data() + 8, 2) != 1) throw std::runtime_error("unsupported object version: " + path.string());
+    if (!S_ISREG(st.st_mode))
+        throw std::runtime_error("object path is not a regular file: " + path.string());
+    if (!std::equal(kMagic.begin(), kMagic.end(), bytes.begin()))
+        throw std::runtime_error("object magic mismatch: " + path.string());
+    if (get_le(bytes.data() + 8, 2) != 1)
+        throw std::runtime_error("unsupported object version: " + path.string());
     const std::uint8_t codec = bytes[10];
-    if (codec > 1) throw std::runtime_error("unsupported object codec: " + path.string());
-    for (std::size_t i = 11; i < 16; ++i) if (bytes[i] != 0) throw std::runtime_error("object has unsupported flags");
+    if (codec > 1)
+        throw std::runtime_error("unsupported object codec: " + path.string());
+    for (std::size_t i = 11; i < 16; ++i)
+        if (bytes[i] != 0)
+            throw std::runtime_error("object has unsupported flags");
     ObjectHeader header;
     header.codec = codec;
     header.raw_bytes = get_le(bytes.data() + 16, 8);
     header.stored_bytes = get_le(bytes.data() + 24, 8);
     std::copy_n(bytes.data() + 32, 32, header.digest.begin());
-    if (header.raw_bytes > kChunkSize || header.stored_bytes > ZSTD_compressBound(kChunkSize)) throw std::runtime_error("object length exceeds format limits");
-    if (static_cast<std::uint64_t>(st.st_size) != kObjectHeaderSize + header.stored_bytes) throw std::runtime_error("object file length does not match header");
-    if (header.codec == 0 && header.raw_bytes != header.stored_bytes) throw std::runtime_error("raw object length mismatch");
+    if (header.raw_bytes > kChunkSize || header.stored_bytes > ZSTD_compressBound(kChunkSize))
+        throw std::runtime_error("object length exceeds format limits");
+    if (static_cast<std::uint64_t>(st.st_size) != kObjectHeaderSize + header.stored_bytes)
+        throw std::runtime_error("object file length does not match header");
+    if (header.codec == 0 && header.raw_bytes != header.stored_bytes)
+        throw std::runtime_error("raw object length mismatch");
     return header;
 }
 
-ObjectHeader read_packed_object_header(const std::filesystem::path& repo, const ObjectLocation& location) {
+ObjectHeader read_packed_object_header(const std::filesystem::path& repo,
+                                       const ObjectLocation& location) {
     const auto path = pack_path(repo, location.pack_id);
     int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) throw std::runtime_error(error_text("open object pack " + path.string()));
+    if (fd < 0)
+        throw std::runtime_error(error_text("open object pack " + path.string()));
     struct stat st{};
-    if (::fstat(fd, &st) != 0) { const auto e = error_text("stat object pack"); ::close(fd); throw std::runtime_error(e); }
+    if (::fstat(fd, &st) != 0) {
+        const auto e = error_text("stat object pack");
+        ::close(fd);
+        throw std::runtime_error(e);
+    }
     try {
         if (!S_ISREG(st.st_mode) || st.st_size < static_cast<off_t>(kPackHeaderSize))
             throw std::runtime_error("pack path is not a valid regular file: " + path.string());
         validate_pack_header(fd, path);
-        if (location.pack_offset < kPackHeaderSize || location.pack_offset > static_cast<std::uint64_t>(st.st_size) ||
+        if (location.pack_offset < kPackHeaderSize ||
+            location.pack_offset > static_cast<std::uint64_t>(st.st_size) ||
             static_cast<std::uint64_t>(st.st_size) - location.pack_offset < kObjectHeaderSize)
             throw std::runtime_error("object offset is outside its pack: " + path.string());
         std::array<std::uint8_t, kObjectHeaderSize> bytes{};
         pread_all(fd, bytes.data(), bytes.size(), location.pack_offset);
-        if (!std::equal(kMagic.begin(), kMagic.end(), bytes.begin())) throw std::runtime_error("object magic mismatch in pack: " + path.string());
-        if (get_le(bytes.data() + 8, 2) != 1) throw std::runtime_error("unsupported packed object version");
+        if (!std::equal(kMagic.begin(), kMagic.end(), bytes.begin()))
+            throw std::runtime_error("object magic mismatch in pack: " + path.string());
+        if (get_le(bytes.data() + 8, 2) != 1)
+            throw std::runtime_error("unsupported packed object version");
         const std::uint8_t codec = bytes[10];
-        if (codec > 1) throw std::runtime_error("unsupported packed object codec");
-        for (std::size_t i = 11; i < 16; ++i) if (bytes[i] != 0) throw std::runtime_error("packed object has unsupported flags");
+        if (codec > 1)
+            throw std::runtime_error("unsupported packed object codec");
+        for (std::size_t i = 11; i < 16; ++i)
+            if (bytes[i] != 0)
+                throw std::runtime_error("packed object has unsupported flags");
         ObjectHeader header;
         header.codec = codec;
         header.raw_bytes = get_le(bytes.data() + 16, 8);
@@ -237,9 +285,12 @@ ObjectHeader read_packed_object_header(const std::filesystem::path& repo, const 
         header.pack_offset = location.pack_offset;
         if (header.raw_bytes > kChunkSize || header.stored_bytes > ZSTD_compressBound(kChunkSize))
             throw std::runtime_error("packed object length exceeds format limits");
-        const std::uint64_t available = static_cast<std::uint64_t>(st.st_size) - location.pack_offset - kObjectHeaderSize;
-        if (header.stored_bytes > available) throw std::runtime_error("packed object payload exceeds pack length");
-        if (header.codec == 0 && header.raw_bytes != header.stored_bytes) throw std::runtime_error("packed raw object length mismatch");
+        const std::uint64_t available =
+            static_cast<std::uint64_t>(st.st_size) - location.pack_offset - kObjectHeaderSize;
+        if (header.stored_bytes > available)
+            throw std::runtime_error("packed object payload exceeds pack length");
+        if (header.codec == 0 && header.raw_bytes != header.stored_bytes)
+            throw std::runtime_error("packed raw object length mismatch");
         ::close(fd);
         return header;
     } catch (...) {
@@ -248,33 +299,48 @@ ObjectHeader read_packed_object_header(const std::filesystem::path& repo, const 
     }
 }
 
-std::vector<std::uint8_t> read_packed_object(const std::filesystem::path& repo, const ObjectLocation& location,
-                                             const std::string& expected_id, ObjectReadTimings* timings) {
+std::vector<std::uint8_t> read_packed_object(const std::filesystem::path& repo,
+                                             const ObjectLocation& location,
+                                             const std::string& expected_id,
+                                             ObjectReadTimings* timings) {
     const auto total_begin = Clock::now();
     const auto header_begin = Clock::now();
     const ObjectHeader header = read_packed_object_header(repo, location);
-    if (timings) timings->io_ns += elapsed_ns(header_begin);
-    if (digest_hex(header.digest) != expected_id) throw std::runtime_error("pack index and object digest differ");
+    if (timings)
+        timings->io_ns += elapsed_ns(header_begin);
+    if (digest_hex(header.digest) != expected_id)
+        throw std::runtime_error("pack index and object digest differ");
     const auto path = pack_path(repo, location.pack_id);
     const auto read_begin = Clock::now();
     int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) throw std::runtime_error(error_text("open object pack"));
+    if (fd < 0)
+        throw std::runtime_error(error_text("open object pack"));
     std::vector<std::uint8_t> payload(static_cast<std::size_t>(header.stored_bytes));
     try {
-        if (!payload.empty()) pread_all(fd, payload.data(), payload.size(), location.pack_offset + kObjectHeaderSize);
-    } catch (...) { ::close(fd); throw; }
+        if (!payload.empty())
+            pread_all(fd, payload.data(), payload.size(), location.pack_offset + kObjectHeaderSize);
+    } catch (...) {
+        ::close(fd);
+        throw;
+    }
     ::close(fd);
-    if (timings) timings->io_ns += elapsed_ns(read_begin);
+    if (timings)
+        timings->io_ns += elapsed_ns(read_begin);
     std::vector<std::uint8_t> raw(static_cast<std::size_t>(header.raw_bytes));
-    if (header.codec == 0) raw = std::move(payload);
+    if (header.codec == 0)
+        raw = std::move(payload);
     else {
         const auto decompress_begin = Clock::now();
-        const auto decoded = ZSTD_decompress(raw.data(), raw.size(), payload.data(), payload.size());
-        if (ZSTD_isError(decoded) || decoded != raw.size()) throw std::runtime_error("zstd packed object decompression failed");
-        if (timings) timings->decompression_ns += elapsed_ns(decompress_begin);
+        const auto decoded =
+            ZSTD_decompress(raw.data(), raw.size(), payload.data(), payload.size());
+        if (ZSTD_isError(decoded) || decoded != raw.size())
+            throw std::runtime_error("zstd packed object decompression failed");
+        if (timings)
+            timings->decompression_ns += elapsed_ns(decompress_begin);
     }
     const auto hash_begin = Clock::now();
-    if (blake3(raw) != header.digest) throw std::runtime_error("packed object content digest mismatch: " + expected_id);
+    if (blake3(raw) != header.digest)
+        throw std::runtime_error("packed object content digest mismatch: " + expected_id);
     if (timings) {
         timings->hash_ns += elapsed_ns(hash_begin);
         timings->total_ns += elapsed_ns(total_begin);
@@ -282,34 +348,47 @@ std::vector<std::uint8_t> read_packed_object(const std::filesystem::path& repo, 
     return raw;
 }
 
-std::vector<std::uint8_t> read_object(const std::filesystem::path& path, const std::string& expected_id,
-                                      ObjectReadTimings* timings) {
+std::vector<std::uint8_t> read_object(const std::filesystem::path& path,
+                                      const std::string& expected_id, ObjectReadTimings* timings) {
     const auto total_begin = Clock::now();
     const auto header_begin = Clock::now();
     const ObjectHeader header = read_object_header(path);
-    if (timings) timings->io_ns += elapsed_ns(header_begin);
-    if (digest_hex(header.digest) != expected_id) throw std::runtime_error("object filename and header digest differ");
+    if (timings)
+        timings->io_ns += elapsed_ns(header_begin);
+    if (digest_hex(header.digest) != expected_id)
+        throw std::runtime_error("object filename and header digest differ");
     const auto read_begin = Clock::now();
     int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) throw std::runtime_error(error_text("open object"));
+    if (fd < 0)
+        throw std::runtime_error(error_text("open object"));
     std::array<std::uint8_t, kObjectHeaderSize> ignored{};
     std::vector<std::uint8_t> payload(static_cast<std::size_t>(header.stored_bytes));
     try {
         read_all(fd, ignored.data(), ignored.size());
-        if (!payload.empty()) read_all(fd, payload.data(), payload.size());
-    } catch (...) { ::close(fd); throw; }
+        if (!payload.empty())
+            read_all(fd, payload.data(), payload.size());
+    } catch (...) {
+        ::close(fd);
+        throw;
+    }
     ::close(fd);
-    if (timings) timings->io_ns += elapsed_ns(read_begin);
+    if (timings)
+        timings->io_ns += elapsed_ns(read_begin);
     std::vector<std::uint8_t> raw(static_cast<std::size_t>(header.raw_bytes));
-    if (header.codec == 0) raw = std::move(payload);
+    if (header.codec == 0)
+        raw = std::move(payload);
     else {
         const auto decompress_begin = Clock::now();
-        const auto decoded = ZSTD_decompress(raw.data(), raw.size(), payload.data(), payload.size());
-        if (ZSTD_isError(decoded) || decoded != raw.size()) throw std::runtime_error("zstd object decompression failed");
-        if (timings) timings->decompression_ns += elapsed_ns(decompress_begin);
+        const auto decoded =
+            ZSTD_decompress(raw.data(), raw.size(), payload.data(), payload.size());
+        if (ZSTD_isError(decoded) || decoded != raw.size())
+            throw std::runtime_error("zstd object decompression failed");
+        if (timings)
+            timings->decompression_ns += elapsed_ns(decompress_begin);
     }
     const auto hash_begin = Clock::now();
-    if (blake3(raw) != header.digest) throw std::runtime_error("object content digest mismatch: " + expected_id);
+    if (blake3(raw) != header.digest)
+        throw std::runtime_error("object content digest mismatch: " + expected_id);
     if (timings) {
         timings->hash_ns += elapsed_ns(hash_begin);
         timings->total_ns += elapsed_ns(total_begin);
@@ -318,12 +397,18 @@ std::vector<std::uint8_t> read_object(const std::filesystem::path& path, const s
 }
 
 void fsync_directory(const std::filesystem::path& path) {
+    // Sync directory-entry changes; unsupported directory sync currently permits EINVAL/ENOTSUP.
+    // This alone does not guarantee power-loss durability on every filesystem.
     int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (fd < 0) throw std::runtime_error(error_text("open directory for sync"));
+    if (fd < 0)
+        throw std::runtime_error(error_text("open directory for sync"));
     const int result = ::fsync(fd);
     const int saved = errno;
     ::close(fd);
-    if (result != 0 && saved != EINVAL && saved != ENOTSUP) { errno = saved; throw std::runtime_error(error_text("sync directory")); }
+    if (result != 0 && saved != EINVAL && saved != ENOTSUP) {
+        errno = saved;
+        throw std::runtime_error(error_text("sync directory"));
+    }
 }
 
 WriteAck write_object(const std::filesystem::path& repo, const std::string& job,
@@ -342,7 +427,8 @@ WriteAck write_object(const std::filesystem::path& repo, const std::string& job,
     std::filesystem::create_directories(staging);
     const auto temp = staging / (id + "." + random_id("obj-") + ".tmp");
     int fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-    if (fd < 0) throw std::runtime_error(error_text("create staging object"));
+    if (fd < 0)
+        throw std::runtime_error(error_text("create staging object"));
     measured->setup_ns += elapsed_ns(setup_begin);
     std::array<std::uint8_t, kObjectHeaderSize> header{};
     std::copy(kMagic.begin(), kMagic.end(), header.begin());
@@ -353,54 +439,80 @@ WriteAck write_object(const std::filesystem::path& repo, const std::string& job,
     std::copy(task.digest.begin(), task.digest.end(), header.begin() + 32);
     try {
         auto phase_begin = Clock::now();
+
+        // 1. Write the temporary object fully and fsync it before making the final path visible.
         measured->staging_write_calls += write_all(fd, header.data(), header.size());
-        if (!task.stored.empty()) measured->staging_write_calls += write_all(fd, task.stored.data(), task.stored.size());
+        if (!task.stored.empty())
+            measured->staging_write_calls += write_all(fd, task.stored.data(), task.stored.size());
         measured->staging_write_ns += elapsed_ns(phase_begin);
         maybe_failpoint(failpoint, "after-temp-write");
         phase_begin = Clock::now();
         const int sync_result = ::fsync(fd);
         const int sync_error = errno;
         measured->file_sync_ns += elapsed_ns(phase_begin);
-        if (sync_result != 0) { errno = sync_error; throw std::runtime_error(error_text("sync staging object")); }
+        if (sync_result != 0) {
+            errno = sync_error;
+            throw std::runtime_error(error_text("sync staging object"));
+        }
         phase_begin = Clock::now();
         const int close_result = ::close(fd);
         const int close_error = errno;
         measured->cleanup_ns += elapsed_ns(phase_begin);
-        if (close_result != 0) { fd = -1; errno = close_error; throw std::runtime_error(error_text("close staging object")); }
+        if (close_result != 0) {
+            fd = -1;
+            errno = close_error;
+            throw std::runtime_error(error_text("close staging object"));
+        }
         fd = -1;
         phase_begin = Clock::now();
-        const int link_result = ::link(temp.c_str(), object_path(repo, id).c_str());
-        const int link_error = errno;
+
+        // 2. Publish without replacement; verify a duplicate already stored at that path.
+        const auto publication = publish_staged_file(temp, object_path(repo, id));
         measured->publish_ns += elapsed_ns(phase_begin);
-        if (link_result == 0) {
+        if (publication != FilePublication::already_exists) {
             maybe_failpoint(failpoint, "after-object-publish");
             phase_begin = Clock::now();
-            const int unlink_result = ::unlink(temp.c_str());
-            const int unlink_error = errno;
+            if (publication == FilePublication::linked) {
+                const int unlink_result = ::unlink(temp.c_str());
+                const int unlink_error = errno;
+                if (unlink_result != 0) {
+                    errno = unlink_error;
+                    throw std::runtime_error(error_text("remove published staging link"));
+                }
+            }
             measured->cleanup_ns += elapsed_ns(phase_begin);
-            if (unlink_result != 0) { errno = unlink_error; throw std::runtime_error(error_text("remove published staging link")); }
             phase_begin = Clock::now();
+
+            // 3. Remove the staging name and sync the object directory before returning an ACK.
             fsync_directory(dir);
-            if (!shard_existed) fsync_directory(repo / "objects");
+            if (!shard_existed)
+                fsync_directory(repo / "objects");
             measured->directory_sync_ns += elapsed_ns(phase_begin);
             measured->total_ns = elapsed_ns(total_begin);
-            return WriteAck{ObjectHeader{task.codec, task.raw_bytes, task.stored.size(), task.digest, true, {}, 0}, true};
+            return WriteAck{
+                ObjectHeader{
+                    task.codec, task.raw_bytes, task.stored.size(), task.digest, true, {}, 0},
+                true};
         }
-        if (link_error != EEXIST) { errno = link_error; throw std::runtime_error(error_text("publish object")); }
         phase_begin = Clock::now();
         const int unlink_result = ::unlink(temp.c_str());
         const int unlink_error = errno;
         measured->cleanup_ns += elapsed_ns(phase_begin);
-        if (unlink_result != 0) { errno = unlink_error; throw std::runtime_error(error_text("remove duplicate staging object")); }
+        if (unlink_result != 0) {
+            errno = unlink_error;
+            throw std::runtime_error(error_text("remove duplicate staging object"));
+        }
         phase_begin = Clock::now();
         const ObjectHeader existing = read_object_header(object_path(repo, id));
         measured->existing_check_ns += elapsed_ns(phase_begin);
-        if (existing.digest != task.digest || existing.raw_bytes != task.raw_bytes) throw std::runtime_error("existing object conflicts with its content address");
+        if (existing.digest != task.digest || existing.raw_bytes != task.raw_bytes)
+            throw std::runtime_error("existing object conflicts with its content address");
         measured->total_ns = elapsed_ns(total_begin);
         return WriteAck{existing, false};
     } catch (...) {
         const auto cleanup_begin = Clock::now();
-        if (fd >= 0) ::close(fd);
+        if (fd >= 0)
+            ::close(fd);
         ::unlink(temp.c_str());
         measured->cleanup_ns += elapsed_ns(cleanup_begin);
         measured->total_ns = elapsed_ns(total_begin);
@@ -423,8 +535,11 @@ struct PackWriter::Impl {
     std::size_t objects = 0;
     ObjectWriteTimings measured;
 
-    Impl(const std::filesystem::path& repo, const std::string& job, const std::string& requested_failpoint)
-        : objects_dir(repo / "objects"), packs_dir(objects_dir / "packs"), failpoint(requested_failpoint) {
+    Impl(const std::filesystem::path& repo, const std::string& job,
+         const std::string& requested_failpoint)
+        : objects_dir(repo / "objects"),
+          packs_dir(objects_dir / "packs"),
+          failpoint(requested_failpoint) {
         const auto operation_begin = Clock::now();
         const auto setup_begin = Clock::now();
         packs_dir_existed = std::filesystem::exists(packs_dir);
@@ -435,7 +550,8 @@ struct PackWriter::Impl {
         temp = staging / (pack_id + ".tmp");
         published = pack_path(repo, pack_id);
         fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-        if (fd < 0) throw std::runtime_error(error_text("create staging object pack"));
+        if (fd < 0)
+            throw std::runtime_error(error_text("create staging object pack"));
         temp_exists = true;
         measured.setup_ns += elapsed_ns(setup_begin);
 
@@ -445,7 +561,8 @@ struct PackWriter::Impl {
             put_le(pack_header.data() + 8, 1, 2);
             const auto write_begin = Clock::now();
             try {
-                measured.staging_write_calls += write_all(fd, pack_header.data(), pack_header.size());
+                measured.staging_write_calls +=
+                    write_all(fd, pack_header.data(), pack_header.size());
             } catch (...) {
                 measured.staging_write_ns += elapsed_ns(write_begin);
                 throw;
@@ -459,7 +576,9 @@ struct PackWriter::Impl {
         }
     }
 
-    ~Impl() { cleanup_temp(); }
+    ~Impl() {
+        cleanup_temp();
+    }
 
     void cleanup_temp() noexcept {
         if (fd >= 0) {
@@ -473,27 +592,36 @@ struct PackWriter::Impl {
     }
 
     std::vector<WriteAck> append_batch(std::span<BlobWriteTask*> tasks) {
-        if (fd < 0 || published_successfully) throw std::runtime_error("cannot append to a closed object pack");
-        if (tasks.empty() || tasks.size() > kPackWriteBatchObjects || objects + tasks.size() > kPackMaxObjects)
+        if (fd < 0 || published_successfully)
+            throw std::runtime_error("cannot append to a closed object pack");
+        if (tasks.empty() || tasks.size() > kPackWriteBatchObjects ||
+            objects + tasks.size() > kPackMaxObjects)
             throw std::runtime_error("object pack write batch exceeds its object limit");
         const auto operation_begin = Clock::now();
         std::array<std::array<std::uint8_t, kObjectHeaderSize>, kPackWriteBatchObjects> headers{};
+
+        // Build iovecs from headers and existing payloads without copying a second large buffer.
         std::array<iovec, kPackWriteBatchObjects * 2> vectors{};
         std::size_t vector_count = 0;
         std::uint64_t next_offset = bytes;
         std::vector<WriteAck> acknowledgements;
         acknowledgements.reserve(tasks.size());
         for (std::size_t i = 0; i < tasks.size(); ++i) {
-            if (!tasks[i]) throw std::runtime_error("object pack contains an empty task");
+            if (!tasks[i])
+                throw std::runtime_error("object pack contains an empty task");
             const auto& task = *tasks[i];
-            if (task.codec > 1 || task.raw_bytes > kChunkSize || task.stored.size() > ZSTD_compressBound(kChunkSize))
+            if (task.codec > 1 || task.raw_bytes > kChunkSize ||
+                task.stored.size() > ZSTD_compressBound(kChunkSize))
                 throw std::runtime_error("object length or codec exceeds pack format limits");
             const auto stored_bytes = static_cast<std::uint64_t>(task.stored.size());
             const auto max_offset = static_cast<std::uint64_t>(std::numeric_limits<off_t>::max());
-            if (next_offset > max_offset - kObjectHeaderSize || stored_bytes > max_offset - next_offset - kObjectHeaderSize)
+            if (next_offset > max_offset - kObjectHeaderSize ||
+                stored_bytes > max_offset - next_offset - kObjectHeaderSize)
                 throw std::runtime_error("object pack exceeds platform file offset limits");
-            acknowledgements.push_back(WriteAck{ObjectHeader{task.codec, task.raw_bytes, stored_bytes,
-                task.digest, true, pack_id, next_offset}, true});
+            acknowledgements.push_back(
+                WriteAck{ObjectHeader{task.codec, task.raw_bytes, stored_bytes, task.digest, true,
+                                      pack_id, next_offset},
+                         true});
             auto& header = headers[i];
             std::copy(kMagic.begin(), kMagic.end(), header.begin());
             put_le(header.data() + 8, 1, 2);
@@ -517,6 +645,8 @@ struct PackWriter::Impl {
         measured.staging_write_ns += elapsed_ns(write_begin);
         bytes = next_offset;
         objects += tasks.size();
+
+        // Release staged payload/credit now; completion still waits for the whole pack to publish.
         for (auto* task : tasks) {
             std::vector<std::uint8_t>().swap(task->stored);
             task->retained_credit.reset();
@@ -532,8 +662,10 @@ struct PackWriter::Impl {
     }
 
     void publish() {
-        if (fd < 0 || published_successfully) throw std::runtime_error("object pack is already closed");
-        if (objects == 0) throw std::runtime_error("cannot publish an empty object pack");
+        if (fd < 0 || published_successfully)
+            throw std::runtime_error("object pack is already closed");
+        if (objects == 0)
+            throw std::runtime_error("cannot publish an empty object pack");
         const auto operation_begin = Clock::now();
         try {
             maybe_failpoint(failpoint, "after-temp-write");
@@ -542,32 +674,46 @@ struct PackWriter::Impl {
             const int sync_result = ::fsync(fd);
             const int sync_error = errno;
             measured.file_sync_ns += elapsed_ns(phase_begin);
-            if (sync_result != 0) { errno = sync_error; throw std::runtime_error(error_text("sync staging object pack")); }
+            if (sync_result != 0) {
+                errno = sync_error;
+                throw std::runtime_error(error_text("sync staging object pack"));
+            }
 
             phase_begin = Clock::now();
             const int close_result = ::close(fd);
             const int close_error = errno;
             measured.cleanup_ns += elapsed_ns(phase_begin);
             fd = -1;
-            if (close_result != 0) { errno = close_error; throw std::runtime_error(error_text("close staging object pack")); }
+            if (close_result != 0) {
+                errno = close_error;
+                throw std::runtime_error(error_text("close staging object pack"));
+            }
 
             phase_begin = Clock::now();
-            const int link_result = ::link(temp.c_str(), published.c_str());
-            const int link_error = errno;
+            const auto publication = publish_staged_file(temp, published);
             measured.publish_ns += elapsed_ns(phase_begin);
-            if (link_result != 0) { errno = link_error; throw std::runtime_error(error_text("publish object pack")); }
+            if (publication == FilePublication::already_exists)
+                throw std::runtime_error("object pack publication destination already exists");
+            if (publication == FilePublication::moved)
+                temp_exists = false;
             maybe_failpoint(failpoint, "after-object-publish");
 
             phase_begin = Clock::now();
-            const int unlink_result = ::unlink(temp.c_str());
-            const int unlink_error = errno;
+            if (publication == FilePublication::linked) {
+                const int unlink_result = ::unlink(temp.c_str());
+                const int unlink_error = errno;
+                if (unlink_result != 0) {
+                    errno = unlink_error;
+                    throw std::runtime_error(error_text("remove published staging pack"));
+                }
+            }
             measured.cleanup_ns += elapsed_ns(phase_begin);
-            if (unlink_result != 0) { errno = unlink_error; throw std::runtime_error(error_text("remove published staging pack")); }
             temp_exists = false;
 
             phase_begin = Clock::now();
             fsync_directory(packs_dir);
-            if (!packs_dir_existed) fsync_directory(objects_dir);
+            if (!packs_dir_existed)
+                fsync_directory(objects_dir);
             measured.directory_sync_ns += elapsed_ns(phase_begin);
             published_successfully = true;
             measured.total_ns += elapsed_ns(operation_begin);
@@ -578,15 +724,36 @@ struct PackWriter::Impl {
     }
 };
 
-PackWriter::PackWriter(const std::filesystem::path& repo, const std::string& job, const std::string& failpoint)
-    : impl_(std::make_unique<Impl>(repo, job, failpoint)) {}
+PackWriter::PackWriter(const std::filesystem::path& repo, const std::string& job,
+                       const std::string& failpoint)
+    : impl_(std::make_unique<Impl>(repo, job, failpoint)) {
+}
+
 PackWriter::~PackWriter() = default;
 PackWriter::PackWriter(PackWriter&&) noexcept = default;
 PackWriter& PackWriter::operator=(PackWriter&&) noexcept = default;
-WriteAck PackWriter::append(BlobWriteTask& task) { return impl_->append(task); }
-std::vector<WriteAck> PackWriter::append_batch(std::span<BlobWriteTask*> tasks) { return impl_->append_batch(tasks); }
-std::uint64_t PackWriter::bytes_written() const noexcept { return impl_ ? impl_->bytes : 0; }
-std::size_t PackWriter::object_count() const noexcept { return impl_ ? impl_->objects : 0; }
-void PackWriter::publish() { impl_->publish(); }
-const ObjectWriteTimings& PackWriter::timings() const noexcept { return impl_->measured; }
+
+WriteAck PackWriter::append(BlobWriteTask& task) {
+    return impl_->append(task);
+}
+
+std::vector<WriteAck> PackWriter::append_batch(std::span<BlobWriteTask*> tasks) {
+    return impl_->append_batch(tasks);
+}
+
+std::uint64_t PackWriter::bytes_written() const noexcept {
+    return impl_ ? impl_->bytes : 0;
+}
+
+std::size_t PackWriter::object_count() const noexcept {
+    return impl_ ? impl_->objects : 0;
+}
+
+void PackWriter::publish() {
+    impl_->publish();
+}
+
+const ObjectWriteTimings& PackWriter::timings() const noexcept {
+    return impl_->measured;
+}
 } // namespace pbe::detail

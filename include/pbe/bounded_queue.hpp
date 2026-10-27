@@ -10,19 +10,26 @@
 #include <utility>
 
 namespace pbe {
-template<class T>
+// A bounded, thread-safe queue: producers wait when full; consumers wait when empty.
+// Backpressure pauses upstream producers when downstream consumers cannot keep up.
+template <class T>
 class BoundedQueue {
 public:
-    explicit BoundedQueue(std::size_t capacity) : capacity_(capacity ? capacity : 1) {}
+    explicit BoundedQueue(std::size_t capacity)
+        : capacity_(capacity ? capacity : 1) {
+    }
+
     BoundedQueue(const BoundedQueue&) = delete;
     BoundedQueue& operator=(const BoundedQueue&) = delete;
 
     bool push(T item, const std::atomic<bool>* cancelled = nullptr) {
+        // Waiting releases the mutex. Recheck the predicate after waking to handle spurious wakeups.
         std::unique_lock lock(mutex_);
         while (!closed_ && queue_.size() >= capacity_ && !(cancelled && cancelled->load())) {
             not_full_.wait_for(lock, std::chrono::milliseconds(50));
         }
-        if (closed_ || (cancelled && cancelled->load())) return false;
+        if (closed_ || (cancelled && cancelled->load()))
+            return false;
         queue_.push(std::move(item));
         not_empty_.notify_one();
         return true;
@@ -33,18 +40,25 @@ public:
         while (queue_.empty() && !closed_ && !(cancelled && cancelled->load())) {
             not_empty_.wait_for(lock, std::chrono::milliseconds(50));
         }
-        if (queue_.empty()) return std::nullopt;
+
+        // Closing still allows queued tasks to drain; only a closed, empty queue returns nullopt.
+        // Stages can finish accepted work normally or report failures for queued tasks on cancellation.
+        if (queue_.empty())
+            return std::nullopt;
         T item = std::move(queue_.front());
         queue_.pop();
         not_full_.notify_one();
         return item;
     }
 
-    template<class Clock, class Duration>
+    template <class Clock, class Duration>
     std::optional<T> pop_until(const std::chrono::time_point<Clock, Duration>& deadline) {
         std::unique_lock lock(mutex_);
-        not_empty_.wait_until(lock, deadline, [&] { return closed_ || !queue_.empty(); });
-        if (queue_.empty()) return std::nullopt;
+        not_empty_.wait_until(lock, deadline, [&] {
+            return closed_ || !queue_.empty();
+        });
+        if (queue_.empty())
+            return std::nullopt;
         T item = std::move(queue_.front());
         queue_.pop();
         not_full_.notify_one();
@@ -52,6 +66,7 @@ public:
     }
 
     void close() {
+        // Stop accepting tasks and wake all push/pop waiters. Repeated calls are safe.
         std::lock_guard lock(mutex_);
         closed_ = true;
         not_empty_.notify_all();
@@ -62,7 +77,10 @@ public:
         std::lock_guard lock(mutex_);
         return queue_.size();
     }
-    std::size_t capacity() const noexcept { return capacity_; }
+
+    std::size_t capacity() const noexcept {
+        return capacity_;
+    }
 
 private:
     const std::size_t capacity_;

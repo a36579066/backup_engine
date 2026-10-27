@@ -5,7 +5,10 @@
 #include "concurrency/worker_pool.hpp"
 #include "scheduler/active_worker_gate.hpp"
 #include "diagnostics/diagnostics.hpp"
-#include "pipeline/metadata_stage.hpp"
+#include "pipeline/04_metadata/metadata_commit.hpp"
+#include "pipeline/backup_pipeline.hpp"
+#include "pipeline/shared/pipeline_context.hpp"
+#include "core/backup_session.hpp"
 #include "storage/catalog.hpp"
 #include "storage/object_store.hpp"
 #include "pbe/blake3.hpp"
@@ -1004,6 +1007,39 @@ void writer_failure_releases_duplicate_waiters() {
     fs::remove_all(root);
 }
 
+void pack_recovery_preserves_sidecars() {
+    const auto root = fs::temp_directory_path() /
+        ("pbe-pack-sidecars-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const auto repo = root / "repo";
+    const auto source = root / "source";
+    fs::create_directories(source);
+    write_bytes(source / "data.bin", std::vector<std::uint8_t>(8192, 'A'));
+    pbe::init_repository(repo, "pack-v2");
+    pbe::BackupOptions options; options.repo = repo; options.source = source;
+    const auto original = pbe::backup(options);
+    const auto packs = repo / "objects" / "packs";
+    std::string published_name;
+    for (const auto& entry : fs::directory_iterator(packs)) {
+        if (entry.path().filename().string().starts_with("pack-") && entry.path().extension() == ".pack")
+            published_name = entry.path().filename().string();
+    }
+    check(!published_name.empty(), "sidecar fixture has a committed pack");
+    const auto sidecar = packs / ("._" + published_name);
+    const auto unrelated = packs / "notes.pack";
+    const auto orphan = packs / "pack-orphan.pack";
+    write_bytes(sidecar, {'O', 'S'});
+    write_bytes(unrelated, {'N', 'O', 'T', 'E'});
+    write_bytes(orphan, {'O', 'R', 'P', 'H', 'A', 'N'});
+    const auto recovered = pbe::backup(options);
+    check(read_text(sidecar) == "OS" && read_text(unrelated) == "NOTE",
+          "pack recovery preserves OS sidecars and unrelated filenames");
+    check(!fs::exists(orphan), "pack recovery removes unindexed repository packs");
+    check(pbe::verify_snapshot(repo, original.id).bytes == 8192 &&
+          pbe::verify_snapshot(repo, recovered.id).bytes == 8192,
+          "sidecar handling preserves the original and recovered snapshots");
+    fs::remove_all(root);
+}
+
 void crash_publish_matrix() {
     for (const std::string storage_format : {"files-v1", "pack-v2"}) {
       for (const std::string failpoint : {"after-temp-write", "after-object-publish", "before-sqlite-batch-commit", "before-final-publish", "after-final-publish"}) {
@@ -1058,6 +1094,50 @@ void crash_publish_matrix() {
       }
     }
 }
+
+void pipeline_scope_exit_cancels_pending_writes() {
+    const auto root = fs::temp_directory_path() / ("paravault-pipeline-lifetime-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const auto source = root / "source";
+    write_bytes(source / "duplicate-chunks.bin", std::vector<std::uint8_t>(2u << 20, 0x47));
+    for (const std::string format : {"files-v1", "pack-v2"}) {
+        const auto repo = root / format;
+        pbe::init_repository(repo, format);
+        pbe::BackupOptions options;
+        options.repo = repo;
+        options.source = source;
+        options.workers = 4;
+        options.writer_workers = 2;
+        options.memory_mib = 8;
+        options.test_writer_delay_ms = 10000;
+        {
+            pbe::detail::BackupSession session(pbe::detail::make_backup_plan(options));
+            auto shutdown_begin = std::chrono::steady_clock::now();
+            {
+                pbe::detail::BackupPipeline pipeline(session);
+                session.begin_snapshot();
+                pipeline.start();
+                pipeline.run_source();
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (pipeline.context().claims.size() == 0 && std::chrono::steady_clock::now() < deadline)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                check(pipeline.context().claims.size() > 0, "scope-exit fixture has an unresolved object claim");
+                shutdown_begin = std::chrono::steady_clock::now();
+                // Leave with live writer work, duplicate continuations and metadata futures.
+            }
+            check(std::chrono::steady_clock::now() - shutdown_begin < std::chrono::seconds(5),
+                  "pipeline destruction cancels and joins pending work promptly");
+            session.fail_snapshot();
+        }
+        check(pbe::list_snapshots(repo).empty(), "abandoned pipeline never publishes a complete snapshot");
+        options.test_writer_delay_ms = 0;
+        const auto recovered = pbe::backup(options);
+        check(pbe::verify_snapshot(repo, recovered.id).bytes == (2u << 20),
+              "repository can be backed up and verified after pipeline scope exit");
+    }
+    fs::remove_all(root);
+}
+
 }
 
 int main() {
@@ -1076,6 +1156,8 @@ int main() {
         object_store_contract();
         std::cout << "[TEST] metadata_stage_contract\n" << std::flush;
         metadata_stage_contract();
+        std::cout << "[TEST] pipeline_scope_exit_cancels_pending_writes\n" << std::flush;
+        pipeline_scope_exit_cancels_pending_writes();
         std::cout << "[TEST] pipeline_across_file_boundaries\n" << std::flush;
         pipeline_across_file_boundaries();
         std::cout << "[TEST] initialization_refuses_existing_data\n" << std::flush;
@@ -1110,6 +1192,8 @@ int main() {
         object_corruption_is_detected();
         std::cout << "[TEST] writer_failure_releases_duplicate_waiters\n" << std::flush;
         writer_failure_releases_duplicate_waiters();
+        std::cout << "[TEST] pack_recovery_preserves_sidecars\n" << std::flush;
+        pack_recovery_preserves_sidecars();
         std::cout << "[TEST] crash_publish_matrix\n" << std::flush;
         crash_publish_matrix();
         std::cout << "PBE tests passed\n";
